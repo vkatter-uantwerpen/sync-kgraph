@@ -16,6 +16,35 @@ static bool mg_ok(enum mgp_error error) {
   return error == MGP_ERROR_NO_ERROR;
 }
 
+#ifdef SYNC_KGRAPH_MGP_COMPAT
+// Compat for Memgraph headers that predate the *_move API and
+// mgp_unordered_map_make_empty. The non-move variants copy the value, so
+// these shims destroy the source on success to preserve the move-semantics
+// contract at the call sites (call sites destroy the value themselves on
+// failure).
+static enum mgp_error sync_compat_list_append_move(struct mgp_list *list,
+                                                   struct mgp_value *value) {
+  const enum mgp_error error = mgp_list_append(list, value);
+  if (error == MGP_ERROR_NO_ERROR) {
+    mgp_value_destroy(value);
+  }
+  return error;
+}
+
+static enum mgp_error sync_compat_map_insert_move(struct mgp_map *map, const char *key,
+                                                  struct mgp_value *value) {
+  const enum mgp_error error = mgp_map_insert(map, key, value);
+  if (error == MGP_ERROR_NO_ERROR) {
+    mgp_value_destroy(value);
+  }
+  return error;
+}
+
+#define mgp_list_append_move sync_compat_list_append_move
+#define mgp_map_insert_move sync_compat_map_insert_move
+#define mgp_unordered_map_make_empty mgp_map_make_empty
+#endif
+
 static void set_error(struct mgp_result *result, const char *message) {
   (void)mgp_result_set_error_msg(result, message);
 }

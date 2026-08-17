@@ -99,6 +99,16 @@ if memgraph_feature.enabled() and not has_memgraph
 endif
 
 if has_memgraph and not memgraph_feature.disabled()
+  # Memgraph gained the mgp_*_move API (and mgp_unordered_map_make_empty) after
+  # 3.1. Against older headers the module needs the compat shims in
+  # src/memgraph/sync_module.c, so detect the API rather than asking the builder
+  # to pass -DSYNC_KGRAPH_MGP_COMPAT by hand.
+  if not cc.has_header_symbol('mg_procedure.h', 'mgp_list_append_move',
+                              args: memgraph_args)
+    message('Memgraph headers predate mgp_*_move; enabling compat shims.')
+    memgraph_args += ['-DSYNC_KGRAPH_MGP_COMPAT']
+  endif
+
   module_link_args = []
   if host_machine.system() == 'darwin'
     module_link_args += ['-Wl,-undefined,dynamic_lookup']
