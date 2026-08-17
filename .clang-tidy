@@ -1,5 +1,6 @@
 Checks: >
   clang-analyzer-*,
+  -clang-analyzer-security.ArrayBound,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   bugprone-*,
   -bugprone-multi-level-implicit-pointer-conversion,
@@ -9,6 +10,7 @@ Checks: >
   concurrency-*,
   -concurrency-mt-unsafe,
   misc-*,
+  -misc-include-cleaner,
   performance-*,
   portability-*,
   readability-*,

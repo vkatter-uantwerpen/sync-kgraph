@@ -1,7 +1,7 @@
 project(
   'sync-kgraph',
   'c',
-  version: '0.1.0',
+  version: '0.2.0',
   default_options: [
     # c2x, not c23: meson only learned 'c23' in 1.4, and this project declares
     # meson_version >=1.3.0. Newer meson still accepts c2x, and both select the
@@ -35,7 +35,11 @@ endforeach
 
 inc = include_directories('include')
 
-sync_sources = files('src/sync.c')
+sync_sources = files(
+  'src/oracle.c',
+  'src/planner.c',
+  'src/sync.c',
+)
 
 sync_lib = static_library(
   'sync_kgraph',

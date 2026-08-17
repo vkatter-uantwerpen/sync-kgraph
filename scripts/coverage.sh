@@ -7,8 +7,10 @@ CC="${CC:-clang}" meson setup "$builddir" --wipe -Db_coverage=true -Dmemgraph=di
 meson test -C "$builddir" --print-errorlogs
 gcovr \
   --root . \
+  --object-directory "$builddir" \
   --gcov-executable "llvm-cov gcov" \
-  --filter src/sync.c \
+  --filter 'src/(oracle|planner|sync)\.c' \
   --exclude 'tests/.*' \
   --fail-under-line 75 \
-  --print-summary
+  --print-summary \
+  "$builddir"

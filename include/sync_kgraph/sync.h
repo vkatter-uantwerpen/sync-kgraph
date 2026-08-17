@@ -3,10 +3,13 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define SG_INDEX_NONE SIZE_MAX
 
 typedef enum {
   SG_OK = 0,
@@ -16,105 +19,162 @@ typedef enum {
   SG_ERR_NOT_FOUND,
   SG_ERR_INCOMPLETE,
   SG_ERR_NONDETERMINISTIC,
-  SG_ERR_UNSYNCHRONIZABLE,
+  SG_ERR_INVALID_MODEL,
   SG_ERR_RESOURCE_BOUND,
+  SG_ERR_STALE_GENERATION,
 } sg_status;
 
 typedef enum {
-  SG_MODE_SYNC = 0,
-  SG_MODE_REACH = 1,
-  SG_MODE_REACH_AND_SYNC = 2,
-} sg_mode;
+  SG_OUTCOME_PLAN = 0,
+  SG_OUTCOME_ALREADY_SATISFIED,
+  SG_OUTCOME_NO_PLAN,
+  SG_OUTCOME_RESOURCE_BOUND,
+} sg_plan_outcome;
 
 typedef enum {
-  SG_RESULT_TRIVIAL = 0,
-  SG_RESULT_PAIR_GREEDY,
-  SG_RESULT_PAIR_GREEDY_TARGETED,
-  SG_RESULT_EXACT_EXPANDED,
-  SG_RESULT_RESOURCE_BOUND,
-  SG_RESULT_FAILURE,
-} sg_result_kind;
+  SG_METHOD_NONE = 0,
+  SG_METHOD_PAIR_MERGE,
+  SG_METHOD_PAIR_RESOLUTION,
+  SG_METHOD_PARTITION_BFS,
+} sg_plan_method;
 
-typedef struct sg_dfa sg_dfa;
-typedef struct sg_dfa_builder sg_dfa_builder;
+typedef enum {
+  SG_MONITOR_CONTINUE = 0,
+  SG_MONITOR_REPLAN,
+  SG_MONITOR_MODEL_VIOLATION,
+  SG_MONITOR_STALE_GENERATION,
+  SG_MONITOR_WAIT,
+} sg_monitor_decision;
+
+typedef struct sg_automaton sg_automaton;
+typedef struct sg_automaton_builder sg_automaton_builder;
 typedef struct sg_pair_oracle sg_pair_oracle;
 
 typedef struct {
-  size_t *letters;
+  size_t *actions;
   size_t length;
   size_t capacity;
 } sg_word;
 
 typedef struct {
-  sg_result_kind kind;
-  sg_status status;
+  sg_plan_outcome outcome;
+  sg_plan_method method;
   sg_word word;
   size_t final_state;
-  size_t final_count;
-} sg_word_result;
+  size_t final_support_size;
+  size_t best_support_size;
+  size_t worst_support_size;
+  size_t branch_count;
+  size_t expansions;
+  bool homing;
+  uint64_t generation;
+  uint64_t planning_time_us;
+} sg_plan_result;
 
-typedef sg_status (*sg_cache_visitor)(void *ctx, const size_t *states, size_t state_count,
-                                      const sg_word *word);
+typedef struct {
+  size_t pair;
+  bool mergeable;
+  size_t merge_distance;
+  size_t merge_action;
+  size_t merge_next_pair;
+  bool resolvable;
+  size_t resolution_distance;
+  size_t resolution_action;
+  size_t resolution_next_pair;
+} sg_pair_record;
+
+typedef struct {
+  sg_monitor_decision decision;
+  size_t *expected_states;
+  size_t expected_count;
+  size_t *unexpected_states;
+  size_t unexpected_count;
+  uint64_t generation;
+} sg_monitor_result;
+
+typedef sg_status (*sg_explain_visitor)(void *context, size_t step, size_t action,
+                                        const size_t *predicted_states, size_t predicted_count,
+                                        const size_t *output_trace, size_t trace_length,
+                                        const size_t *branch_states, size_t branch_count);
 
 const char *sg_status_name(sg_status status);
-const char *sg_result_kind_name(sg_result_kind kind);
-const char *sg_mode_name(sg_mode mode);
-sg_status sg_mode_parse(const char *name, sg_mode *mode);
+const char *sg_plan_outcome_name(sg_plan_outcome outcome);
+const char *sg_plan_method_name(sg_plan_method method);
+const char *sg_monitor_decision_name(sg_monitor_decision decision);
 
 sg_status sg_word_init(sg_word *word);
 void sg_word_free(sg_word *word);
-sg_status sg_word_append(sg_word *word, size_t letter);
-sg_status sg_word_prepend(sg_word *word, size_t letter);
+sg_status sg_word_append(sg_word *word, size_t action);
 
-sg_status sg_dfa_builder_init(sg_dfa_builder **builder);
-void sg_dfa_builder_free(sg_dfa_builder *builder);
-sg_status sg_dfa_builder_add_state(sg_dfa_builder *builder, const char *state_key);
-sg_status sg_dfa_builder_add_letter(sg_dfa_builder *builder, const char *letter);
-sg_status sg_dfa_builder_add_transition(sg_dfa_builder *builder, const char *source_key,
-                                        const char *letter, const char *target_key);
-sg_status sg_dfa_builder_build(sg_dfa_builder *builder, bool complete_with_sink, sg_dfa **dfa);
+sg_status sg_automaton_builder_init(sg_automaton_builder **builder);
+void sg_automaton_builder_free(sg_automaton_builder *builder);
+sg_status sg_automaton_builder_add_state(sg_automaton_builder *builder, const char *state_key);
+sg_status sg_automaton_builder_add_action(sg_automaton_builder *builder, const char *action_key);
+sg_status sg_automaton_builder_add_output(sg_automaton_builder *builder, const char *output_key);
+sg_status sg_automaton_builder_add_transition(sg_automaton_builder *builder, const char *source_key,
+                                              const char *action_key, const char *target_key);
+sg_status sg_automaton_builder_add_observation(sg_automaton_builder *builder,
+                                               const char *source_key, const char *action_key,
+                                               const char *output_key);
+sg_status sg_automaton_builder_build(sg_automaton_builder *builder, uint64_t generation,
+                                     sg_automaton **automaton);
 
-void sg_dfa_free(sg_dfa *dfa);
-size_t sg_dfa_state_count(const sg_dfa *dfa);
-size_t sg_dfa_letter_count(const sg_dfa *dfa);
-size_t sg_dfa_transition_count(const sg_dfa *dfa);
-const char *sg_dfa_state_key(const sg_dfa *dfa, size_t state);
-const char *sg_dfa_letter_key(const sg_dfa *dfa, size_t letter);
-size_t sg_dfa_transition(const sg_dfa *dfa, size_t state, size_t letter);
-sg_status sg_dfa_find_state(const sg_dfa *dfa, const char *state_key, size_t *state);
-sg_status sg_dfa_find_letter(const sg_dfa *dfa, const char *letter, size_t *letter_id);
+void sg_automaton_free(sg_automaton *automaton);
+uint64_t sg_automaton_generation(const sg_automaton *automaton);
+size_t sg_automaton_state_count(const sg_automaton *automaton);
+size_t sg_automaton_action_count(const sg_automaton *automaton);
+size_t sg_automaton_output_count(const sg_automaton *automaton);
+size_t sg_automaton_transition_count(const sg_automaton *automaton);
+const char *sg_automaton_state_key(const sg_automaton *automaton, size_t state);
+const char *sg_automaton_action_key(const sg_automaton *automaton, size_t action);
+const char *sg_automaton_output_key(const sg_automaton *automaton, size_t output);
+size_t sg_automaton_transition(const sg_automaton *automaton, size_t state, size_t action);
+size_t sg_automaton_observation(const sg_automaton *automaton, size_t state, size_t action);
+sg_status sg_automaton_find_state(const sg_automaton *automaton, const char *state_key,
+                                  size_t *state);
+sg_status sg_automaton_find_action(const sg_automaton *automaton, const char *action_key,
+                                   size_t *action);
+sg_status sg_automaton_find_output(const sg_automaton *automaton, const char *output_key,
+                                   size_t *output);
 
-sg_status sg_pair_oracle_build(const sg_dfa *dfa, sg_pair_oracle **oracle);
+sg_status sg_pair_oracle_build(const sg_automaton *automaton, sg_pair_oracle **oracle);
+sg_status sg_pair_oracle_restore(const sg_automaton *automaton, const sg_pair_record *records,
+                                 size_t record_count, sg_pair_oracle **oracle);
 void sg_pair_oracle_free(sg_pair_oracle *oracle);
 size_t sg_pair_oracle_pair_count(const sg_pair_oracle *oracle);
 size_t sg_pair_oracle_pair_edge_count(const sg_pair_oracle *oracle);
 size_t sg_pair_oracle_mergeable_pair_count(const sg_pair_oracle *oracle);
+size_t sg_pair_oracle_resolvable_pair_count(const sg_pair_oracle *oracle);
 sg_status sg_pair_oracle_pair_states(const sg_pair_oracle *oracle, size_t pair, size_t *first,
                                      size_t *second);
-sg_status sg_pair_oracle_pair_next(const sg_pair_oracle *oracle, size_t pair, size_t letter,
-                                   size_t *next_pair);
-sg_status sg_pair_oracle_pair_witness(const sg_pair_oracle *oracle, size_t pair, bool *has_witness,
-                                      size_t *distance, size_t *letter, size_t *next_pair);
-bool sg_pair_oracle_has_witness(const sg_pair_oracle *oracle, size_t first, size_t second);
-sg_status sg_pair_oracle_witness_word(const sg_pair_oracle *oracle, size_t first, size_t second,
-                                      sg_word *word);
+sg_status sg_pair_oracle_pair_step(const sg_pair_oracle *oracle, size_t pair, size_t action,
+                                   size_t *next_pair, bool *outputs_differ);
+sg_status sg_pair_oracle_record(const sg_pair_oracle *oracle, size_t pair, sg_pair_record *record);
+sg_status sg_pair_oracle_merge_word(const sg_pair_oracle *oracle, size_t first, size_t second,
+                                    sg_word *word);
+sg_status sg_pair_oracle_resolution_word(const sg_pair_oracle *oracle, size_t first, size_t second,
+                                         sg_word *word);
 
-sg_status sg_word_for_set(const sg_dfa *dfa, const sg_pair_oracle *oracle, const size_t *initial,
-                          size_t initial_count, const size_t *targets, size_t target_count,
-                          sg_mode mode, size_t exact_budget, sg_word_result *result);
-void sg_word_result_free(sg_word_result *result);
-sg_status sg_expand_cache(const sg_dfa *dfa, const size_t *targets, size_t target_count,
-                          sg_mode mode, size_t budget, size_t *expanded, size_t *cache_size);
-sg_status sg_expand_cache_visit(const sg_dfa *dfa, const size_t *targets, size_t target_count,
-                                sg_mode mode, size_t budget, sg_cache_visitor visitor, void *ctx,
-                                size_t *expanded, size_t *cache_size);
+sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                       const size_t *initial_states, size_t initial_count, size_t budget,
+                       sg_plan_result *result);
+sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                               const size_t *initial_states, size_t initial_count, size_t bound,
+                               size_t budget, sg_plan_result *result);
+void sg_plan_result_free(sg_plan_result *result);
 
-sg_status sg_apply_word_to_set(const sg_dfa *dfa, const size_t *initial, size_t initial_count,
-                               const sg_word *word, size_t *output, size_t *output_count);
-sg_status sg_explain_word(const sg_dfa *dfa, const size_t *initial, size_t initial_count,
-                          const sg_word *word, size_t **steps, size_t **step_counts,
-                          size_t *step_count);
-void sg_explain_free(size_t *steps, size_t *step_counts);
+sg_status sg_apply_word(const sg_automaton *automaton, const size_t *initial_states,
+                        size_t initial_count, const sg_word *word, size_t *output_states,
+                        size_t *output_count);
+sg_status sg_explain_plan(const sg_automaton *automaton, uint64_t plan_generation,
+                          const size_t *initial_states, size_t initial_count, const sg_word *word,
+                          sg_explain_visitor visitor, void *context);
+sg_status sg_validate_update(const sg_automaton *automaton, uint64_t plan_generation,
+                             const size_t *initial_states, size_t initial_count,
+                             const sg_word *word, size_t completed_steps,
+                             const size_t *reported_states, size_t reported_count,
+                             bool localizer_available, sg_monitor_result *result);
+void sg_monitor_result_free(sg_monitor_result *result);
 
 #ifdef __cplusplus
 }
