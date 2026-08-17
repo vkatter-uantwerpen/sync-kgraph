@@ -22,8 +22,7 @@ static bool mg_ok(enum mgp_error error) {
 // these shims destroy the source on success to preserve the move-semantics
 // contract at the call sites (call sites destroy the value themselves on
 // failure).
-static enum mgp_error sync_compat_list_append_move(struct mgp_list *list,
-                                                   struct mgp_value *value) {
+static enum mgp_error sync_compat_list_append_move(struct mgp_list *list, struct mgp_value *value) {
   const enum mgp_error error = mgp_list_append(list, value);
   if (error == MGP_ERROR_NO_ERROR) {
     mgp_value_destroy(value);
