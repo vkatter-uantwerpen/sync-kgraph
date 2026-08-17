@@ -1,277 +1,340 @@
 # sync-kgraph
 
-`sync-kgraph` implements schema-agnostic synchronizing-word queries over a
-deterministic automaton view of a knowledge graph. The core algorithms are C23
-and build with Meson. Query/view glue is Cypher, and the native Memgraph module
-is compiled from C when Memgraph's `mg_procedure.h` is available.
+`sync-kgraph` implements the synchronize-or-reveal algorithms from the
+companion paper as a C23 library and a native Memgraph query module. It treats a
+manually mapped knowledge-graph view as a deterministic Mealy automaton and can:
 
-Implemented pieces:
+- validate complete transition and observation functions;
+- build and persist a generation-scoped pair merge/resolution oracle;
+- plan an open-loop word that synchronizes a hypothesis set;
+- plan an output-partitioning word that reveals the current hypothesis;
+- fall back to exact bounded partition BFS when a pair witness is insufficient;
+- explain predicted supports and output branches after every action; and
+- monitor localization updates as `CONTINUE`, `REPLAN`, `MODEL_VIOLATION`,
+  `STALE_GENERATION`, or `WAIT`.
 
-- DFA view validation for completeness and determinism.
-- Reverse transition/preimage support.
-- Reverse pair graph with BFS pair-compression witnesses, materialized as
-  `SyncPair`, `PAIR_NEXT`, and `PAIR_PRE`.
-- Greedy synchronizing-word construction for hypothesis sets.
-- Target validation for `SYNC`, `REACH`, and `REACH_AND_SYNC`.
-- Bounded reverse-subset expansion for exact reachability cases, materialized
-  as `SyncSubset`.
-- Step-by-step explanation of active hypotheses after each action.
+All algorithm and Memgraph module code is C23. Cypher is used only for schema,
+mapping, and example queries. Meson builds the library, CLI, tests, and optional
+Memgraph module.
 
-## Build
+## Build And Test
+
+Core build:
 
 ```sh
 CC=clang meson setup build -Dmemgraph=disabled
-ninja -C build
+meson compile -C build
 meson test -C build --print-errorlogs
-sh scripts/valgrind.sh build-valgrind
-./build/sync-kgraph-cli --example office
+./build/sync-kgraph-cli --example warehouse
 ```
 
-To build the Memgraph module, point Meson at the Memgraph C API header:
+Build the native module against the header installed with the target Memgraph
+server. This is preferred over using a header from a different release:
 
 ```sh
 CC=clang meson setup build-memgraph \
   -Dmemgraph=enabled \
   -Dmemgraph_include_dir=/usr/include/memgraph
-ninja -C build-memgraph
+meson compile -C build-memgraph
 ```
 
-For a locally installed Memgraph, prefer the installed header so the module is
-compiled against the server ABI:
-
-```sh
-CC=clang meson setup build-local-memgraph \
-  -Dmemgraph=enabled \
-  -Dmemgraph_include_dir=/usr/include/memgraph
-ninja -C build-local-memgraph
-```
-
-The module artifact is `sync.so`. Install it into Memgraph's query module
-directory, then load it:
+The Linux artifact is `build-memgraph/sync.so`; macOS produces the native
+shared-module equivalent. Install with Meson, or place that file in the
+server's query-module directory and load it:
 
 ```cypher
 CALL mg.load("sync");
 CALL mg.procedures() YIELD name
+WITH name
 WHERE name STARTS WITH "sync."
-RETURN name
-ORDER BY name;
+RETURN name ORDER BY name;
 ```
 
-To smoke-test a local server after loading the module:
+Expected procedure names:
+
+```text
+sync.explain_plan
+sync.mark_dirty
+sync.plan_disambiguate
+sync.plan_sync
+sync.prepare_model
+sync.validate_update
+```
+
+Run the local integration test with an already installed Memgraph:
 
 ```sh
-MEMGRAPH_PORT=7687 sh scripts/memgraph_local_smoke.sh
+sh scripts/memgraph_local_smoke.sh build-memgraph
 ```
 
-The smoke test uses the temporary model name `sync_kgraph_smoke` and deletes
-only nodes with that exact `model` property before and after the test.
+It starts a separate Memgraph process on a temporary port with private data,
+log, and module directories. It never connects to or modifies the normal
+Memgraph instance on port 7687.
 
-## Memgraph View Contract
+## Manual View Contract
 
-The application schema is not rewritten. A deployment manually materializes the
-automaton view into Sync-KGraph's namespace:
+Run `cypher/install_schema.cypher` once. The application schema is otherwise
+untouched. Create dedicated view nodes and relationships for each model:
 
 ```cypher
-(:SyncModel {model, generation, dirty})
-(:SyncState {model, state_key, state_id, base_id?})
-(:SyncLetter {model, letter, letter_id})
-(:SyncState)-[:SYNC_TRANS {model, letter}]->(:SyncState)
+(:SyncModel {
+  model, generation, dirty, prepared_generation?
+})
+(:SyncState {
+  model, state_key, state_id?, semantic_ref?, orientation?
+})
+(:SyncAction {
+  model, action_key, action_id?
+})
+(:SyncOutput {
+  model, output_key, output_id?
+})
+(:SyncState)-[:SYNC_TRANS {
+  model, action_key
+}]->(:SyncState)
+(:SyncState)-[:SYNC_OBS {
+  model, action_key
+}]->(:SyncOutput)
 ```
 
-The native module writes auxiliary view objects:
+Keys must be unique within their domain and model. For every state/action pair,
+there must be exactly one `SYNC_TRANS` and one `SYNC_OBS`. An observation is the
+output emitted for the source state and selected action. Optional numeric IDs
+only control stable ordering; keys are the public interface.
+
+The mapping is deliberately manual because only the database owner knows how
+application entities, orientations, commands, and sensor abstractions form the
+automaton. Prefer separate `SyncState` nodes linked by `semantic_ref` or an
+application-owned relationship instead of adding `SyncState` to application
+nodes. The supplied uninstall script deletes nodes in the Sync-KGraph
+namespace.
+
+After creating or changing the view:
+
+1. Set `dirty: true` and advance `generation`, or call
+   `sync.mark_dirty(model)` for an existing model.
+2. Call `sync.prepare_model(model, materialize_pair_edges)`.
+3. Store the returned generation with every plan.
+4. Reject or replan work when monitor output is `STALE_GENERATION`.
+
+`prepare_model` validates the strict Mealy model and always persists one
+`SyncPair` record for every unordered pair with repetition. Passing `true` also
+persists `PAIR_NEXT` and `PAIR_PRE` relationships for inspection. Planning uses
+the compact pair records, so edge materialization is optional.
+
+The trigger file is a template, not a generic installed trigger. Adapt its
+predicate to the application labels and relationships that feed each model. A
+schema-agnostic trigger cannot identify the affected model safely.
+
+## Procedure Interface
 
 ```cypher
-(:SyncPair {model, pair_id, first_key, second_key, distance, has_witness,
-            witness, next_pair, generation})
-(:SyncPair)-[:PAIR_NEXT {model, letter, letter_id}]->(:SyncPair)
-(:SyncPair)-[:PAIR_PRE {model, letter, letter_id}]->(:SyncPair)
-(:SyncSubset {model, mode, target_key, subset_key, word, size,
-              word_length, generation})
-```
-
-Run `cypher/install_schema.cypher` once for indexes. Then map existing graph
-objects into `SyncState`, map symbolic commands into `SyncLetter`, and create
-one `SYNC_TRANS` relationship for every `(state, letter)` pair. The C module
-expects the materialized view to be complete and deterministic unless
-`sync.build_model(model, true)` is used to complete missing transitions with a
-sink state in memory.
-
-Primary procedures:
-
-```cypher
-CALL sync.validate_model(model)
-CALL sync.build_pair_oracle(model, materialize)
-CALL sync.word_for_set(model, state_keys, target_keys, mode, budget)
-CALL sync.word_to_target(model, state_keys, target_keys, mode, budget)
-CALL sync.expand_cache(model, target_keys, mode, budget)
-CALL sync.explain(model, state_keys, word)
+CALL sync.prepare_model(model, materialize_pair_edges = false)
+CALL sync.plan_sync(model, hypotheses, budget)
+CALL sync.plan_disambiguate(model, hypotheses, bound, budget)
+CALL sync.explain_plan(model, generation, hypotheses, word)
+CALL sync.validate_update(
+  model, generation, hypotheses, word, completed_steps,
+  reported_hypotheses, localizer_available = true)
 CALL sync.mark_dirty(model)
 ```
 
-The module does not execute arbitrary user Cypher strings. Compute hypotheses
-with normal Cypher, collect their `state_key` values, then pass that list to
-`sync.word_for_set` or `sync.word_to_target`. The `materialize` argument to
-`sync.build_pair_oracle` defaults to `true`.
+`hypotheses`, `reported_hypotheses`, and returned supports are lists of
+`state_key` strings. Words are lists of `action_key` strings. `budget` limits
+search expansions; `bound` is the required worst-case output-branch support
+size. A bound of one requests a homing word.
 
-## Worked Example
+Planner calls return an `outcome` of `PLAN`, `ALREADY_SATISFIED`, `NO_PLAN`, or
+`RESOURCE_BOUND`, and a `method` of `PAIR_MERGE`, `PAIR_RESOLUTION`,
+`PARTITION_BFS`, or `NONE`. Dirty or unprepared models are rejected.
 
-Load the office automaton:
+The public C API is in `include/sync_kgraph/sync.h`. It exposes the same
+automaton builder, pair oracle, planners, explanation visitor, and monitor
+without requiring Memgraph.
 
-```cypher
-\i examples/office/00_reset_and_load.cypher
-```
+## Worked Warehouse Example
 
-It resets only Sync-KGraph view objects with `model: "office"`, then creates
-states `A`, `B`, `C` and letters `north`, `east`.
+The example maps two ambiguous bays, two corridor poses, and one dock pose.
+Run each numbered file with `mgconsole`, or execute the queries shown below.
 
-Transitions:
-
-```text
-north: A -> B, B -> C, C -> C
-east:  A -> A, B -> B, C -> C
-```
-
-Validate the view:
-
-```cypher
-CALL sync.validate_model("office")
-YIELD ok, code, message, states, letters, transitions
-RETURN ok, code, message, states, letters, transitions;
-```
-
-Expected:
-
-```text
-ok: true
-code: "OK"
-message: "model is complete and deterministic"
-states: 3
-letters: 2
-transitions: 6
-```
-
-Build/check the pair oracle:
-
-```cypher
-CALL sync.build_pair_oracle("office")
-YIELD status, pairs, pair_edges, mergeable_pairs, materialized, generation
-RETURN status, pairs, pair_edges, mergeable_pairs, materialized, generation;
-```
-
-Expected:
-
-```text
-status: "OK"
-pairs: 6
-pair_edges: 12
-mergeable_pairs: 6
-materialized: true
-generation: 0
-```
-
-Inspect the materialized pair graph:
-
-```cypher
-MATCH (p:SyncPair {model: "office"})
-RETURN count(p) AS pairs;
-```
-
-Expected:
-
-```text
-pairs: 6
-```
-
-```cypher
-MATCH (:SyncPair {model: "office"})-[r:PAIR_NEXT {model: "office"}]->
-      (:SyncPair {model: "office"})
-RETURN count(r) AS pair_next;
-```
-
-Expected:
-
-```text
-pair_next: 12
-```
-
-Ask for a word from hypothesis `["A", "B"]` to target `["C"]`:
-
-```cypher
-CALL sync.word_to_target("office", ["A", "B"], ["C"], "REACH_AND_SYNC", 64)
-YIELD status, word, length, final_state_key, generation
-RETURN status, word, length, final_state_key, generation;
-```
-
-Expected:
-
-```text
-status: "PAIR_GREEDY_TARGETED"
-word: ["north", "north"]
-length: 2
-final_state_key: "C"
-generation: 0
-```
-
-Explain the returned word:
-
-```cypher
-CALL sync.explain("office", ["A", "B"], ["north", "north"])
-YIELD step, letter, active_state_keys
-RETURN step, letter, active_state_keys
-ORDER BY step;
-```
-
-Expected:
-
-```text
-step: 0, letter: "", active_state_keys: ["A", "B"]
-step: 1, letter: "north", active_state_keys: ["B", "C"]
-step: 2, letter: "north", active_state_keys: ["C"]
-```
-
-Expand the reverse-subset cache for target `C`:
-
-```cypher
-CALL sync.expand_cache("office", ["C"], "REACH_AND_SYNC", 64)
-YIELD status, expanded, cache_size
-RETURN status, expanded, cache_size;
-```
-
-Expected:
-
-```text
-status: "OK"
-expanded: 3
-cache_size: 3
-```
-
-Inspect the persisted cache:
-
-```cypher
-MATCH (s:SyncSubset {model: "office", mode: "REACH_AND_SYNC", target_key: "C"})
-RETURN count(s) AS subsets;
-```
-
-Expected:
-
-```text
-subsets: 3
-```
-
-The same example can be checked without Memgraph:
+### 1. Install The Schema
 
 ```sh
-./build/sync-kgraph-cli --example office
+mgconsole < cypher/install_schema.cypher
 ```
 
-## Quality Gates
+Expected: nine indexes are created and no data rows are returned. Reuse these
+indexes for every mapped model.
 
-CI runs `clang-format`, `clang-tidy`, `meson test`, Valgrind leak checks,
-`gcovr` with a minimum line coverage gate of 75%, and a Dockerized Memgraph
-module smoke test. Release tags publish:
+### 2. Load The Manual View
 
-- `sync-kgraph-linux-x86_64.tar.gz`
-- `sync-kgraph-macos-arm64.tar.gz`
+```sh
+mgconsole < examples/warehouse/00_reset_and_load.cypher
+```
 
-Each bundle contains the native binary artifacts, Cypher scripts, the GSS view,
-the office example, `README.md`, `LICENSE`, and a SHA-256 checksum.
+Verify the mapping:
+
+```cypher
+MATCH (m:SyncModel {model: "warehouse"})
+OPTIONAL MATCH (s:SyncState {model: "warehouse"})
+WITH m, count(s) AS states
+OPTIONAL MATCH (a:SyncAction {model: "warehouse"})
+WITH m, states, count(a) AS actions
+OPTIONAL MATCH (o:SyncOutput {model: "warehouse"})
+RETURN m.generation AS generation, m.dirty AS dirty,
+       states, actions, count(o) AS outputs;
+```
+
+Expected:
+
+```text
+generation: 1, dirty: true, states: 5, actions: 4, outputs: 4
+```
+
+The view contains 20 transitions and 20 observations, one of each per
+state/action cell.
+
+### 3. Prepare The Model
+
+```cypher
+CALL sync.prepare_model("warehouse", true)
+YIELD status, generation, states, actions, outputs, transitions, pairs,
+      pair_edges, mergeable_pairs, resolvable_pairs, materialized_pair_edges
+RETURN status, generation, states, actions, outputs, transitions, pairs,
+       pair_edges, mergeable_pairs, resolvable_pairs, materialized_pair_edges;
+```
+
+Expected:
+
+```text
+"OK", 1, 5, 4, 4, 20, 15, 60, 15, 15, true
+```
+
+There are 15 unordered state pairs with repetition and 60 pair/action edges.
+Because edge materialization was enabled, the graph contains 15 `SyncPair`, 60
+`PAIR_NEXT`, and 60 `PAIR_PRE` records.
+
+### 4. Plan Synchronization
+
+```cypher
+CALL sync.plan_sync(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, method, word, length, final_state_key,
+      final_support_size, generation
+RETURN status, outcome, method, word, length, final_state_key,
+       final_support_size, generation;
+```
+
+Expected:
+
+```text
+"OK", "PLAN", "PAIR_MERGE", ["to_corridor", "go_west"], 2,
+"dock:north", 1, 1
+```
+
+### 5. Plan Disambiguation
+
+```cypher
+CALL sync.plan_disambiguate(
+  "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
+YIELD status, outcome, method, word, length, best_support_size,
+      worst_support_size, branch_count, homing, generation
+RETURN status, outcome, method, word, length, best_support_size,
+       worst_support_size, branch_count, homing, generation;
+```
+
+Expected:
+
+```text
+"OK", "PLAN", "PAIR_RESOLUTION", ["to_corridor"], 1,
+1, 1, 2, true, 1
+```
+
+The two bays emit different landmark outputs under `to_corridor`, so one
+action partitions the initial support into two singleton branches.
+
+### 6. Explain The Synchronizing Word
+
+```cypher
+CALL sync.explain_plan(
+  "warehouse", 1,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"])
+YIELD step, action, predicted_hypotheses, output_trace, branch_hypotheses
+RETURN step, action, predicted_hypotheses, output_trace, branch_hypotheses
+ORDER BY step, output_trace;
+```
+
+Expected rows:
+
+```text
+0, "", [west_bay:east, east_bay:west], [],
+   [west_bay:east, east_bay:west]
+1, "to_corridor", [corridor_w:east, corridor_e:west],
+   [west_landmark], [corridor_w:east]
+1, "to_corridor", [corridor_w:east, corridor_e:west],
+   [east_landmark], [corridor_e:west]
+2, "go_west", [dock:north], [west_landmark, dock], [dock:north]
+2, "go_west", [dock:north], [east_landmark, dock], [dock:north]
+```
+
+### 7. Validate A Localization Update
+
+```cypher
+CALL sync.validate_update(
+  "warehouse", 1,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1,
+  ["corridor_w:east", "corridor_e:west"], true)
+YIELD status, decision, expected_hypotheses, unexpected_hypotheses, generation
+RETURN status, decision, expected_hypotheses, unexpected_hypotheses, generation;
+```
+
+Expected:
+
+```text
+"OK", "CONTINUE", [corridor_w:east, corridor_e:west], [], 1
+```
+
+Reporting only one expected corridor returns `REPLAN`; reporting `dock:north`
+at this step returns `MODEL_VIOLATION`; passing an unavailable localizer returns
+`WAIT`.
+
+### 8. Invalidate Old Plans
+
+```cypher
+CALL sync.mark_dirty("warehouse") YIELD status, generation
+RETURN status, generation;
+```
+
+Expected:
+
+```text
+"DIRTY", 2
+```
+
+Planning is now rejected until `sync.prepare_model("warehouse", false)`
+succeeds. A monitor call carrying generation 1 returns:
+
+```text
+status: "OK", decision: "STALE_GENERATION", generation: 2
+```
+
+## Quality And Releases
+
+```sh
+sh scripts/check-format.sh
+sh scripts/run-clang-tidy.sh build-tidy
+sh scripts/valgrind.sh build-valgrind
+sh scripts/coverage.sh build-coverage /usr/include/memgraph
+```
+
+CI treats all Clang diagnostics as errors, runs every unit test under Valgrind
+with all leak kinds fatal, compiles against multiple Memgraph C API versions,
+and runs the full Memgraph integration contract. Coverage includes every
+production C source file, including the CLI and Memgraph adapter, and fails
+below 75% line coverage.
+
+Release tags publish `linux-x86_64` and native `macos-arm64` archives. Each
+archive includes the CLI, C library and header, Memgraph module, Cypher mapping
+scripts, Memgraph Lab GSS view, worked example, license, and SHA-256 checksum.

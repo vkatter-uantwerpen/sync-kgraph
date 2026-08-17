@@ -1,9 +1,12 @@
 project(
   'sync-kgraph',
   'c',
-  version: '0.1.0',
+  version: '0.2.0',
   default_options: [
-    'c_std=c23',
+    # c2x, not c23: meson only learned 'c23' in 1.4, and this project declares
+    # meson_version >=1.3.0. Newer meson still accepts c2x, and both select the
+    # same standard, so c2x is the portable spelling.
+    'c_std=c2x',
     'warning_level=3',
     'werror=true',
     'b_lundef=false',
@@ -32,7 +35,11 @@ endforeach
 
 inc = include_directories('include')
 
-sync_sources = files('src/sync.c')
+sync_sources = files(
+  'src/oracle.c',
+  'src/planner.c',
+  'src/sync.c',
+)
 
 sync_lib = static_library(
   'sync_kgraph',
@@ -96,6 +103,16 @@ if memgraph_feature.enabled() and not has_memgraph
 endif
 
 if has_memgraph and not memgraph_feature.disabled()
+  # Memgraph gained the mgp_*_move API (and mgp_unordered_map_make_empty) after
+  # 3.1. Against older headers the module needs the compat shims in
+  # src/memgraph/sync_module.c, so detect the API rather than asking the builder
+  # to pass -DSYNC_KGRAPH_MGP_COMPAT by hand.
+  if not cc.has_header_symbol('mg_procedure.h', 'mgp_list_append_move',
+                              args: memgraph_args)
+    message('Memgraph headers predate mgp_*_move; enabling compat shims.')
+    memgraph_args += ['-DSYNC_KGRAPH_MGP_COMPAT']
+  endif
+
   module_link_args = []
   if host_machine.system() == 'darwin'
     module_link_args += ['-Wl,-undefined,dynamic_lookup']
@@ -126,6 +143,6 @@ install_data(
 )
 
 install_subdir(
-  'examples/office',
+  'examples/warehouse',
   install_dir: get_option('datadir') / 'sync-kgraph' / 'examples',
 )

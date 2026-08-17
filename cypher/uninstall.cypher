@@ -1,8 +1,9 @@
-// Remove Sync-KGraph auxiliary objects for every model. This intentionally
-// leaves the application graph untouched.
+// Remove only Sync-KGraph view and auxiliary objects. Application graph nodes
+// outside these labels are intentionally left untouched.
 
 MATCH (n)
-WHERE n:SyncModel OR n:SyncState OR n:SyncLetter OR n:SyncPair OR n:SyncSubset
+WHERE n:SyncModel OR n:SyncState OR n:SyncAction OR n:SyncOutput OR n:SyncPair
 DETACH DELETE n;
 
-DROP TRIGGER sync_kgraph_mark_dirty;
+// Drop an adapted dirty-marking trigger separately if one was installed from
+// cypher/triggers_mark_dirty.cypher.
