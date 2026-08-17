@@ -1,69 +1,91 @@
 #!/usr/bin/env sh
 set -eu
 
-host="${MEMGRAPH_HOST:-127.0.0.1}"
-port="${MEMGRAPH_PORT:-7687}"
-model="${SYNC_KGRAPH_SMOKE_MODEL:-sync_kgraph_smoke}"
+builddir="${1:-build-memgraph-local}"
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+case "$builddir" in
+/*) module="$builddir/sync.so" ;;
+*) module="$root/$builddir/sync.so" ;;
+esac
+memgraph="${MEMGRAPH_BINARY:-/usr/lib/memgraph/memgraph}"
+port="${MEMGRAPH_TEST_PORT:-$((17687 + ($$ % 10000)))}"
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/sync-kgraph-memgraph.XXXXXX")
+pid=""
 
-run_query() {
-  printf '%s\n' "$1" | mgconsole \
-    --host="$host" \
-    --port="$port" \
-    --output_format=csv \
-    --no_history
+cleanup() {
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT HUP INT TERM
+
+dump_logs() {
+  if [ -f "$tmpdir/stderr.log" ]; then
+    cat "$tmpdir/stderr.log" >&2
+  fi
+  if [ -f "$tmpdir/memgraph.log" ]; then
+    cat "$tmpdir/memgraph.log" >&2
+  fi
 }
 
-run_query 'CALL mg.load("sync");' >/dev/null
+if [ ! -f "$module" ]; then
+  echo "missing Memgraph module: $module" >&2
+  exit 2
+fi
+if [ ! -x "$memgraph" ]; then
+  echo "missing Memgraph executable: $memgraph" >&2
+  exit 2
+fi
+if ! command -v mgconsole >/dev/null 2>&1; then
+  echo "mgconsole is required for the local integration test" >&2
+  exit 2
+fi
 
-run_query "MATCH (n)
-WHERE (n:SyncModel OR n:SyncState OR n:SyncLetter OR n:SyncPair OR n:SyncSubset)
-  AND n.model = \"$model\"
-DETACH DELETE n;" >/dev/null
+mkdir -p "$tmpdir/data" "$tmpdir/modules" "$tmpdir/query-logs"
+cp "$module" "$tmpdir/modules/sync.so"
 
-run_query "CREATE (:SyncModel {model: \"$model\", generation: 0, dirty: false});
-CREATE (:SyncState {model: \"$model\", state_key: \"A\", state_id: 0});
-CREATE (:SyncState {model: \"$model\", state_key: \"B\", state_id: 1});
-CREATE (:SyncState {model: \"$model\", state_key: \"C\", state_id: 2});
-CREATE (:SyncLetter {model: \"$model\", letter: \"north\", letter_id: 0});
-CREATE (:SyncLetter {model: \"$model\", letter: \"east\", letter_id: 1});
-MATCH (a:SyncState {model: \"$model\", state_key: \"A\"})
-MATCH (b:SyncState {model: \"$model\", state_key: \"B\"})
-MATCH (c:SyncState {model: \"$model\", state_key: \"C\"})
-CREATE (a)-[:SYNC_TRANS {model: \"$model\", letter: \"north\"}]->(b)
-CREATE (b)-[:SYNC_TRANS {model: \"$model\", letter: \"north\"}]->(c)
-CREATE (c)-[:SYNC_TRANS {model: \"$model\", letter: \"north\"}]->(c)
-CREATE (a)-[:SYNC_TRANS {model: \"$model\", letter: \"east\"}]->(a)
-CREATE (b)-[:SYNC_TRANS {model: \"$model\", letter: \"east\"}]->(b)
-CREATE (c)-[:SYNC_TRANS {model: \"$model\", letter: \"east\"}]->(c);" >/dev/null
+"$memgraph" \
+  --bolt-address=127.0.0.1 \
+  --bolt-port="$port" \
+  --data-directory="$tmpdir/data" \
+  --data-recovery-on-startup=false \
+  --log-file="$tmpdir/memgraph.log" \
+  --metrics-address=127.0.0.1 \
+  --metrics-port="$((port + 1))" \
+  --monitoring-address=127.0.0.1 \
+  --monitoring-port="$((port + 2))" \
+  --query-log-directory="$tmpdir/query-logs" \
+  --query-modules-directory="$tmpdir/modules" \
+  --storage-snapshot-interval-sec=0 \
+  --storage-snapshot-on-exit=false \
+  --storage-wal-enabled=false \
+  --telemetry-enabled=false >"$tmpdir/stderr.log" 2>&1 &
+pid=$!
 
-validate="$(run_query "CALL sync.validate_model(\"$model\") YIELD ok, code RETURN ok, code;")"
-printf '%s\n' "$validate" | grep -q "true"
-printf '%s\n' "$validate" | grep -q "OK"
+ready=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    dump_logs
+    echo "isolated Memgraph process exited before becoming ready" >&2
+    exit 1
+  fi
+  if printf 'RETURN 1;\n' | mgconsole \
+    --host=127.0.0.1 --port="$port" --no_history >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
 
-oracle="$(run_query "CALL sync.build_pair_oracle(\"$model\") YIELD status, pairs, pair_edges, mergeable_pairs, materialized RETURN status, pairs, pair_edges, mergeable_pairs, materialized;")"
-printf '%s\n' "$oracle" | grep -q "OK"
-printf '%s\n' "$oracle" | grep -q "true"
+if [ "$ready" -ne 1 ]; then
+  dump_logs
+  echo "isolated Memgraph process did not become ready" >&2
+  exit 1
+fi
 
-pairs="$(run_query "MATCH (p:SyncPair {model: \"$model\"}) RETURN count(p) AS pairs;")"
-printf '%s\n' "$pairs" | grep -q "6"
+MEMGRAPH_HOST=127.0.0.1 MEMGRAPH_PORT="$port" \
+  sh "$root/scripts/memgraph_integration.sh" local
 
-pair_edges="$(run_query "MATCH (:SyncPair {model: \"$model\"})-[r:PAIR_NEXT {model: \"$model\"}]->(:SyncPair {model: \"$model\"}) RETURN count(r) AS pair_next;")"
-printf '%s\n' "$pair_edges" | grep -q "12"
-
-word="$(run_query "CALL sync.word_to_target(\"$model\", [\"A\", \"B\"], [\"C\"], \"REACH_AND_SYNC\", 64) YIELD status, word, length, final_state_key RETURN status, word, length, final_state_key;")"
-printf '%s\n' "$word" | grep -q "PAIR_GREEDY_TARGETED"
-printf '%s\n' "$word" | grep -q "north"
-printf '%s\n' "$word" | grep -q "C"
-
-cache="$(run_query "CALL sync.expand_cache(\"$model\", [\"C\"], \"REACH_AND_SYNC\", 64) YIELD status, expanded, cache_size RETURN status, expanded, cache_size;")"
-printf '%s\n' "$cache" | grep -q "OK"
-
-subsets="$(run_query "MATCH (s:SyncSubset {model: \"$model\", mode: \"REACH_AND_SYNC\", target_key: \"C\"}) RETURN count(s) AS subsets;")"
-printf '%s\n' "$subsets" | grep -q "3"
-
-run_query "MATCH (n)
-WHERE (n:SyncModel OR n:SyncState OR n:SyncLetter OR n:SyncPair OR n:SyncSubset)
-  AND n.model = \"$model\"
-DETACH DELETE n;" >/dev/null
-
-echo "Local Memgraph smoke test passed"
+echo "Local smoke used isolated temporary data and left the installed database untouched"
