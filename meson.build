@@ -143,6 +143,6 @@ install_data(
 )
 
 install_subdir(
-  'examples/office',
+  'examples/warehouse',
   install_dir: get_option('datadir') / 'sync-kgraph' / 'examples',
 )
