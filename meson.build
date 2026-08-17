@@ -3,7 +3,10 @@ project(
   'c',
   version: '0.1.0',
   default_options: [
-    'c_std=c23',
+    # c2x, not c23: meson only learned 'c23' in 1.4, and this project declares
+    # meson_version >=1.3.0. Newer meson still accepts c2x, and both select the
+    # same standard, so c2x is the portable spelling.
+    'c_std=c2x',
     'warning_level=3',
     'werror=true',
     'b_lundef=false',
