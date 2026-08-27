@@ -59,6 +59,10 @@ typedef struct {
   sg_min_heap heap;
 } sg_objective_state;
 
+static void sg_metric_add(size_t *metric, size_t amount) {
+  *metric = amount > SIZE_MAX - *metric ? SIZE_MAX : *metric + amount;
+}
+
 static bool sg_id_vector_reserve(sg_id_vector *vector, size_t capacity) {
   if (capacity <= vector->capacity) {
     return true;
@@ -252,6 +256,7 @@ static sg_status sg_evaluate_pairs(sg_repair_context *context, const size_t *pai
   }
   sg_status status =
       context->store->read_records(context->store->context, pair_ids, pair_count, current);
+  sg_metric_add(&context->metrics->pair_records_examined, pair_count);
   if (status != SG_OK) {
     free(current);
     return status;
@@ -260,6 +265,7 @@ static sg_status sg_evaluate_pairs(sg_repair_context *context, const size_t *pai
     evaluations[index].current = current[index];
   }
   status = context->store->read_outgoing(context->store->context, pair_ids, pair_count, &arcs);
+  sg_metric_add(&context->metrics->pair_edges_examined, arcs.count);
   size_t expected_arcs = 0U;
   if (status == SG_OK &&
       (!sg_size_multiply(pair_count, context->store->action_count, &expected_arcs) ||
@@ -315,6 +321,7 @@ static sg_status sg_evaluate_pairs(sg_repair_context *context, const size_t *pai
   }
   if (status == SG_OK) {
     status = context->store->read_records(context->store->context, target_ids, arcs.count, targets);
+    sg_metric_add(&context->metrics->pair_records_examined, arcs.count);
   }
   for (size_t index = 0U; status == SG_OK && index < arcs.count; ++index) {
     const sg_pair_arc arc = arcs.items[index];
@@ -389,35 +396,16 @@ static bool sg_mark_touched(sg_repair_context *context, size_t pair) {
   return context->metrics->pair_records_touched <= context->repair_budget;
 }
 
-static sg_status sg_write_evaluations(sg_repair_context *context, sg_objective_state *state,
-                                      const sg_pair_evaluation *evaluations, size_t count,
-                                      sg_repair_objective objective) {
-  sg_pair_record *records = calloc(count == 0U ? 1U : count, sizeof(*records));
-  if (records == NULL) {
-    return SG_ERR_ALLOC;
+static sg_status sg_write_records(sg_repair_context *context, const sg_pair_record *records,
+                                  size_t record_count) {
+  if (record_count == 0U) {
+    return SG_OK;
   }
-  size_t write_count = 0U;
-  for (size_t index = 0U; index < count; ++index) {
-    if (!sg_record_objective_equal(&evaluations[index].current, &evaluations[index].candidate,
-                                   objective)) {
-      const size_t pair = evaluations[index].candidate.pair;
-      records[write_count] = evaluations[index].candidate;
-      ++write_count;
-      if (!state->changed[pair]) {
-        state->changed[pair] = true;
-        if (objective == SG_REPAIR_MERGE) {
-          ++context->metrics->merge_pairs_changed;
-        } else {
-          ++context->metrics->resolution_pairs_changed;
-        }
-      }
-    }
+  const sg_status status =
+      context->store->write_records(context->store->context, records, record_count);
+  if (status == SG_OK) {
+    sg_metric_add(&context->metrics->pair_records_written, record_count);
   }
-  sg_status status = SG_OK;
-  if (write_count != 0U) {
-    status = context->store->write_records(context->store->context, records, write_count);
-  }
-  free(records);
   return status;
 }
 
@@ -455,6 +443,9 @@ static sg_status sg_collect_sources(sg_repair_context *context, const size_t *ta
   sg_pair_arc_batch arcs = {0};
   sg_status status =
       context->store->read_incoming(context->store->context, targets, target_count, &arcs);
+  if (status == SG_OK) {
+    sg_metric_add(&context->metrics->pair_edges_examined, arcs.count);
+  }
   if (status != SG_OK) {
     return status;
   }
@@ -482,61 +473,70 @@ static sg_status sg_collect_sources(sg_repair_context *context, const size_t *ta
   return status;
 }
 
-static sg_status sg_force_seed_invalidation(sg_repair_context *context, sg_objective_state *state,
-                                            const size_t *seed_pairs, size_t seed_count,
-                                            sg_repair_objective objective) {
-  sg_id_vector seeds = {0};
-  for (size_t index = 0U; index < seed_count; ++index) {
+static sg_status sg_seed_objective_changes(sg_repair_context *context, sg_objective_state *state,
+                                           const size_t *seed_pairs, size_t seed_count,
+                                           sg_repair_objective objective) {
+  sg_pair_evaluation *evaluations =
+      calloc(seed_count == 0U ? 1U : seed_count, sizeof(*evaluations));
+  sg_pair_record *writes = calloc(seed_count == 0U ? 1U : seed_count, sizeof(*writes));
+  if (evaluations == NULL || writes == NULL) {
+    free(evaluations);
+    free(writes);
+    return SG_ERR_ALLOC;
+  }
+  sg_status status = sg_evaluate_pairs(context, seed_pairs, seed_count, objective, evaluations);
+  size_t write_count = 0U;
+  for (size_t index = 0U; status == SG_OK && index < seed_count; ++index) {
     const size_t pair = seed_pairs[index];
     if (pair >= context->store->pair_count) {
-      sg_id_vector_free(&seeds);
-      return SG_ERR_INVALID_ARGUMENT;
+      status = SG_ERR_INVALID_ARGUMENT;
+      break;
     }
-    if (!context->diagonal[pair] && !state->invalid[pair]) {
+    if (context->diagonal[pair]) {
+      continue;
+    }
+    if (!sg_mark_touched(context, pair)) {
+      status = SG_ERR_RESOURCE_BOUND;
+      break;
+    }
+    const size_t current_distance = sg_record_distance(&evaluations[index].current, objective);
+    const size_t candidate_distance = sg_record_distance(&evaluations[index].candidate, objective);
+    if (candidate_distance > current_distance) {
       state->invalid[pair] = true;
-      if (!sg_mark_touched(context, pair)) {
-        sg_id_vector_free(&seeds);
-        return SG_ERR_RESOURCE_BOUND;
-      }
-      if (!sg_id_vector_append(&seeds, pair) || !sg_id_vector_append(&state->invalidated, pair)) {
-        sg_id_vector_free(&seeds);
-        return SG_ERR_ALLOC;
+      sg_record_make_unreachable(&evaluations[index].candidate, objective);
+      if (!sg_id_vector_append(&state->invalidated, pair)) {
+        status = SG_ERR_ALLOC;
+        break;
       }
       if (objective == SG_REPAIR_MERGE) {
         ++context->metrics->merge_pairs_invalidated;
       } else {
         ++context->metrics->resolution_pairs_invalidated;
       }
+    } else if (candidate_distance < current_distance && !state->queued[pair]) {
+      state->queued[pair] = true;
+      if (!sg_id_vector_append(&state->decreases, pair)) {
+        status = SG_ERR_ALLOC;
+        break;
+      }
     }
-  }
-  sg_pair_evaluation *evaluations =
-      calloc(seeds.count == 0U ? 1U : seeds.count, sizeof(*evaluations));
-  sg_pair_record *current = calloc(seeds.count == 0U ? 1U : seeds.count, sizeof(*current));
-  if (evaluations == NULL || current == NULL) {
-    free(current);
-    free(evaluations);
-    sg_id_vector_free(&seeds);
-    return SG_ERR_ALLOC;
-  }
-  sg_status status =
-      context->store->read_records(context->store->context, seeds.items, seeds.count, current);
-  for (size_t index = 0U; status == SG_OK && index < seeds.count; ++index) {
-    evaluations[index].current = current[index];
-  }
-  for (size_t index = 0U; status == SG_OK && index < seeds.count; ++index) {
-    if (evaluations[index].current.pair != seeds.items[index]) {
-      status = SG_ERR_INVALID_MODEL;
-      break;
+    if (!sg_record_objective_equal(&evaluations[index].current, &evaluations[index].candidate,
+                                   objective)) {
+      writes[write_count] = evaluations[index].candidate;
+      ++write_count;
+      state->changed[pair] = true;
+      if (objective == SG_REPAIR_MERGE) {
+        ++context->metrics->merge_pairs_changed;
+      } else {
+        ++context->metrics->resolution_pairs_changed;
+      }
     }
-    evaluations[index].candidate = evaluations[index].current;
-    sg_record_make_unreachable(&evaluations[index].candidate, objective);
   }
   if (status == SG_OK) {
-    status = sg_write_evaluations(context, state, evaluations, seeds.count, objective);
+    status = sg_write_records(context, writes, write_count);
   }
-  free(current);
+  free(writes);
   free(evaluations);
-  sg_id_vector_free(&seeds);
   return status;
 }
 
@@ -609,7 +609,7 @@ static sg_status sg_invalidate_dependents(sg_repair_context *context, sg_objecti
       }
     }
     if (status == SG_OK && write_count != 0U) {
-      status = context->store->write_records(context->store->context, writes, write_count);
+      status = sg_write_records(context, writes, write_count);
     }
     free(writes);
     free(evaluations);
@@ -651,6 +651,9 @@ static sg_status sg_relax_invalid_predecessors(sg_repair_context *context,
   sg_pair_arc_batch arcs = {0};
   sg_status status =
       context->store->read_incoming(context->store->context, targets, target_count, &arcs);
+  if (status == SG_OK) {
+    sg_metric_add(&context->metrics->pair_edges_examined, arcs.count);
+  }
   for (size_t index = 0U; status == SG_OK && index < arcs.count; ++index) {
     const sg_pair_arc arc = arcs.items[index];
     if (arc.source_pair >= context->store->pair_count ||
@@ -756,7 +759,7 @@ static sg_status sg_rebuild_invalidated(sg_repair_context *context, sg_objective
       }
     }
     if (status == SG_OK && write_count != 0U) {
-      status = context->store->write_records(context->store->context, writes, write_count);
+      status = sg_write_records(context, writes, write_count);
     }
     if (status == SG_OK && finalized.count != 0U) {
       status = sg_relax_invalid_predecessors(context, state, finalized.items, finalized.count,
@@ -832,7 +835,7 @@ static sg_status sg_propagate_decreases(sg_repair_context *context, sg_objective
       }
     }
     if (status == SG_OK && write_count != 0U) {
-      status = context->store->write_records(context->store->context, writes, write_count);
+      status = sg_write_records(context, writes, write_count);
     }
     free(writes);
     free(evaluations);
@@ -849,7 +852,7 @@ static sg_status sg_repair_one_objective(sg_repair_context *context, const size_
   sg_objective_state state = {0};
   sg_status status = sg_objective_state_init(context->store->pair_count, &state);
   if (status == SG_OK) {
-    status = sg_force_seed_invalidation(context, &state, seed_pairs, seed_count, objective);
+    status = sg_seed_objective_changes(context, &state, seed_pairs, seed_count, objective);
   }
   if (status == SG_OK) {
     status = sg_invalidate_dependents(context, &state, objective);

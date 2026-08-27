@@ -1,6 +1,8 @@
 #include "sync_kgraph/sync.h"
 
 #include "dynamic.h"
+#include "snapshot.h"
+#include "snapshot_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +134,11 @@ static sg_status memory_write_records(void *context, const sg_pair_record *recor
     store->records[records[index].pair] = records[index];
   }
   return SG_OK;
+}
+
+static sg_status snapshot_read_records(void *context, const size_t *pair_ids, size_t pair_count,
+                                       sg_pair_record *records) {
+  return sg_pair_snapshot_read(context, pair_ids, pair_count, records);
 }
 
 static void add_keys(sg_automaton_builder *builder, const char *const *states, size_t state_count,
@@ -696,7 +703,7 @@ static void test_incremental_pair_maintenance(void) {
     CHECK(seed_count == NUMERIC_STATE_COUNT);
     sg_pair_repair_metrics metrics = {0};
     CHECK(sg_pair_store_repair(&store, seeds, seed_count, memory.pair_count, &metrics) == SG_OK);
-    CHECK(metrics.pair_records_touched >= seed_count);
+    CHECK(metrics.pair_records_examined >= seed_count);
     CHECK(metrics.pair_records_touched <= memory.pair_count);
     for (size_t pair = 0U; pair < memory.pair_count; ++pair) {
       sg_pair_record expected = {0};
@@ -734,6 +741,124 @@ static void test_incremental_pair_maintenance(void) {
   memory_store_free(&memory);
 }
 
+static void test_snapshot_maintenance_and_cache(void) {
+  size_t transitions[NUMERIC_CELL_COUNT] = {0};
+  size_t observations[NUMERIC_CELL_COUNT] = {0};
+  for (size_t state = 0U; state < NUMERIC_STATE_COUNT; ++state) {
+    for (size_t action = 0U; action < NUMERIC_ACTION_COUNT; ++action) {
+      const size_t cell = (state * NUMERIC_ACTION_COUNT) + action;
+      transitions[cell] = (state + action + 1U) % NUMERIC_STATE_COUNT;
+      observations[cell] = (state + action) % NUMERIC_OUTPUT_COUNT;
+    }
+  }
+  sg_automaton *automaton = build_numeric_automaton(transitions, observations, UINT64_C(1));
+  sg_pair_oracle *oracle = NULL;
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  sg_pair_snapshot *snapshot = NULL;
+  CHECK(sg_pair_snapshot_from_oracle(automaton, oracle, &snapshot) == SG_OK);
+  const size_t pair_count = sg_pair_snapshot_pair_count(snapshot);
+  CHECK(pair_count == sg_pair_oracle_pair_count(oracle));
+  CHECK(sg_pair_snapshot_memory_bytes(snapshot) != 0U);
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+
+  for (size_t step = 0U; step < NUMERIC_MUTATION_COUNT; ++step) {
+    const size_t state = ((step * NUMERIC_MUTATION_STRIDE) + 1U) % NUMERIC_STATE_COUNT;
+    const size_t action = ((step * NUMERIC_ACTION_STRIDE) + 2U) % NUMERIC_ACTION_COUNT;
+    const size_t cell = (state * NUMERIC_ACTION_COUNT) + action;
+    if (step % NUMERIC_ACTION_COUNT != 0U) {
+      transitions[cell] =
+          (transitions[cell] + 1U + (step % NUMERIC_MUTATION_STRIDE)) % NUMERIC_STATE_COUNT;
+    }
+    if (step % NUMERIC_ACTION_COUNT != 1U) {
+      observations[cell] ^= 1U;
+    }
+    sg_pair_snapshot *candidate = NULL;
+    CHECK(sg_pair_snapshot_clone(snapshot, (uint64_t)step + UINT64_C(2), &candidate) == SG_OK);
+    bool changed = false;
+    CHECK(sg_pair_snapshot_set_cell(candidate, state, action, transitions[cell], observations[cell],
+                                    &changed) == SG_OK);
+    CHECK(changed);
+    size_t seeds[NUMERIC_STATE_COUNT] = {0};
+    size_t seed_count = 0U;
+    size_t pair = 0U;
+    for (size_t first = 0U; first < NUMERIC_STATE_COUNT; ++first) {
+      for (size_t second = first; second < NUMERIC_STATE_COUNT; ++second) {
+        if (first == state || second == state) {
+          seeds[seed_count] = pair;
+          ++seed_count;
+        }
+        ++pair;
+      }
+    }
+    CHECK(seed_count == NUMERIC_STATE_COUNT);
+    sg_pair_repair_metrics metrics = {0};
+    CHECK(sg_pair_snapshot_repair(candidate, seeds, seed_count, pair_count, &metrics) == SG_OK);
+    CHECK(metrics.pair_records_examined >= seed_count);
+    CHECK(metrics.pair_edges_examined != 0U);
+    CHECK(sg_pair_snapshot_changed_count(candidate) <= pair_count);
+
+    automaton = build_numeric_automaton(transitions, observations, (uint64_t)step + UINT64_C(2));
+    CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+    for (pair = 0U; pair < pair_count; ++pair) {
+      sg_pair_record expected = {0};
+      sg_pair_record actual = {0};
+      CHECK(sg_pair_oracle_record(oracle, pair, &expected) == SG_OK);
+      CHECK(sg_pair_snapshot_record(candidate, pair, &actual) == SG_OK);
+      check_pair_records_equal(&actual, &expected);
+    }
+    sg_pair_oracle_free(oracle);
+    sg_automaton_free(automaton);
+    sg_pair_snapshot_clear_changes(candidate);
+    sg_pair_snapshot_release(snapshot);
+    snapshot = candidate;
+  }
+
+  const sg_automaton *snapshot_automaton = sg_pair_snapshot_automaton(snapshot);
+  const size_t hypotheses[] = {0U, 1U, 2U, 3U};
+  const sg_pair_record_source source = {
+      .context = snapshot,
+      .read = snapshot_read_records,
+  };
+  sg_plan_result from_snapshot = {0};
+  sg_plan_result rebuilt = {0};
+  CHECK(sg_pair_oracle_build(snapshot_automaton, &oracle) == SG_OK);
+  CHECK(sg_plan_sync_from_records(snapshot_automaton, &source, hypotheses, 4U, 64U,
+                                  &from_snapshot) == SG_OK);
+  CHECK(sg_plan_sync(snapshot_automaton, oracle, hypotheses, 4U, 64U, &rebuilt) == SG_OK);
+  check_plan_semantics_equal(&from_snapshot, &rebuilt);
+  sg_plan_result_free(&from_snapshot);
+  sg_plan_result_free(&rebuilt);
+  sg_pair_oracle_free(oracle);
+
+  const size_t bytes = sg_pair_snapshot_memory_bytes(snapshot);
+  sg_snapshot_cache *cache = NULL;
+  CHECK(sg_snapshot_cache_create(bytes, &cache) == SG_OK);
+  bool stored = false;
+  CHECK(sg_snapshot_cache_insert(cache, "numeric", UINT64_C(3), UINT64_C(49), "token-a", snapshot,
+                                 &stored) == SG_OK);
+  CHECK(stored);
+  CHECK(sg_snapshot_cache_bytes(cache) == bytes);
+  sg_pair_snapshot *found =
+      sg_snapshot_cache_lookup(cache, "numeric", UINT64_C(3), UINT64_C(49), "token-a");
+  CHECK(found == snapshot);
+  sg_pair_snapshot_release(found);
+  CHECK(sg_snapshot_cache_lookup(cache, "numeric", UINT64_C(3), UINT64_C(49), "wrong") == NULL);
+
+  sg_pair_snapshot *second = NULL;
+  CHECK(sg_pair_snapshot_clone(snapshot, UINT64_C(50), &second) == SG_OK);
+  CHECK(sg_snapshot_cache_insert(cache, "numeric", UINT64_C(3), UINT64_C(50), "token-b", second,
+                                 &stored) == SG_OK);
+  CHECK(stored);
+  CHECK(sg_snapshot_cache_lookup(cache, "numeric", UINT64_C(3), UINT64_C(49), "token-a") == NULL);
+  found = sg_snapshot_cache_lookup(cache, "numeric", UINT64_C(3), UINT64_C(50), "token-b");
+  CHECK(found == second);
+  sg_pair_snapshot_release(found);
+  sg_pair_snapshot_release(second);
+  sg_snapshot_cache_free(cache);
+  sg_pair_snapshot_release(snapshot);
+}
+
 int main(void) {
   test_names_and_builder_validation();
   test_automaton_and_oracle();
@@ -741,5 +866,6 @@ int main(void) {
   test_exact_partition_search();
   test_oracle_source_equivalence();
   test_incremental_pair_maintenance();
+  test_snapshot_maintenance_and_cache();
   return EXIT_SUCCESS;
 }

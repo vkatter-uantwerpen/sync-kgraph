@@ -10,5 +10,5 @@ The ambiguous bay hypotheses synchronize at `dock:north` under
 outputs, so `["to_corridor"]` is also a homing disambiguation word.
 
 Files 00 through 05 demonstrate a visual snapshot oracle. File 06 reprepares
-the same model in incremental mode and atomically changes one observation cell
-while preserving the oracle epoch.
+the same model in compact incremental mode and atomically changes one
+observation cell while preserving the oracle epoch.

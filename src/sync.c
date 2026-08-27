@@ -499,6 +499,60 @@ void sg_automaton_free(sg_automaton *automaton) {
   free(automaton);
 }
 
+sg_status sg_automaton_clone_generation(const sg_automaton *source, uint64_t generation,
+                                        sg_automaton **clone) {
+  if (source == NULL || clone == NULL) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  *clone = NULL;
+  sg_automaton *created = calloc(1U, sizeof(*created));
+  if (created == NULL) {
+    return SG_ERR_ALLOC;
+  }
+  created->generation = generation;
+  created->state_count = source->state_count;
+  created->action_count = source->action_count;
+  created->output_count = source->output_count;
+  sg_status status = sg_copy_keys(source->state_keys, source->state_count, &created->state_keys);
+  if (status == SG_OK) {
+    status = sg_copy_keys(source->action_keys, source->action_count, &created->action_keys);
+  }
+  if (status == SG_OK) {
+    status = sg_copy_keys(source->output_keys, source->output_count, &created->output_keys);
+  }
+  size_t cells = 0U;
+  if (status == SG_OK && !sg_size_multiply(source->state_count, source->action_count, &cells)) {
+    status = SG_ERR_ALLOC;
+  }
+  if (status == SG_OK) {
+    created->transitions = malloc(cells * sizeof(*created->transitions));
+    created->observations = malloc(cells * sizeof(*created->observations));
+    if (created->transitions == NULL || created->observations == NULL) {
+      status = SG_ERR_ALLOC;
+    }
+  }
+  if (status == SG_OK) {
+    memcpy(created->transitions, source->transitions, cells * sizeof(*created->transitions));
+    memcpy(created->observations, source->observations, cells * sizeof(*created->observations));
+    *clone = created;
+    return SG_OK;
+  }
+  sg_automaton_free(created);
+  return status;
+}
+
+sg_status sg_automaton_set_cell(sg_automaton *automaton, size_t state, size_t action, size_t target,
+                                size_t output) {
+  if (automaton == NULL || state >= automaton->state_count || action >= automaton->action_count ||
+      target >= automaton->state_count || output >= automaton->output_count) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  const size_t cell = (state * automaton->action_count) + action;
+  automaton->transitions[cell] = target;
+  automaton->observations[cell] = output;
+  return SG_OK;
+}
+
 uint64_t sg_automaton_generation(const sg_automaton *automaton) {
   return automaton == NULL ? 0U : automaton->generation;
 }

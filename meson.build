@@ -15,6 +15,7 @@ project(
 )
 
 cc = meson.get_compiler('c')
+threads = dependency('threads')
 
 common_args = [
   '-D_POSIX_C_SOURCE=200809L',
@@ -39,6 +40,8 @@ sync_sources = files(
   'src/dynamic.c',
   'src/oracle.c',
   'src/planner.c',
+  'src/snapshot.c',
+  'src/snapshot_cache.c',
   'src/sync.c',
 )
 
@@ -46,12 +49,14 @@ sync_lib = static_library(
   'sync_kgraph',
   sync_sources,
   include_directories: inc,
+  dependencies: threads,
   install: true,
 )
 
 sync_dep = declare_dependency(
   include_directories: inc,
   link_with: sync_lib,
+  dependencies: threads,
 )
 
 install_headers('include/sync_kgraph/sync.h', subdir: 'sync_kgraph')
@@ -71,6 +76,13 @@ test_core = executable(
 )
 
 test('core', test_core)
+
+ablation_benchmark = executable(
+  'ablation_benchmark',
+  'tests/ablation_benchmark.c',
+  dependencies: sync_dep,
+  include_directories: include_directories('src'),
+)
 
 valgrind = find_program('valgrind', required: false)
 if valgrind.found()

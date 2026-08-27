@@ -92,15 +92,18 @@ CALL sync.plan_sync_uncached(
 YIELD status, outcome, method, word, length, final_state_key,
       final_support_size, generation, oracle_source, oracle_builds,
       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
-      oracle_time_us, total_compute_time_us
+      cache_state, snapshot_record_reads, oracle_time_us,
+      snapshot_hydration_time_us, total_compute_time_us
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND method = "PAIR_MERGE"
                  AND word = ["to_corridor", "go_west"] AND length = 2
                  AND final_state_key = "dock:north"
                  AND final_support_size = 1 AND generation = 1
                  AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+                 AND cache_state = "BYPASSED" AND snapshot_record_reads = 0
                  AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
                  AND oracle_cache_hits = 0
+                 AND snapshot_hydration_time_us = 0
                  AND oracle_time_us >= 0 AND total_compute_time_us >= oracle_time_us
             THEN "PASS" ELSE "FAIL" END AS result;'
 
@@ -110,15 +113,18 @@ CALL sync.plan_disambiguate_uncached(
 YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation,
       oracle_source, oracle_builds, oracle_rows_loaded,
-      oracle_load_batches, oracle_cache_hits
+      oracle_load_batches, oracle_cache_hits, cache_state,
+      snapshot_record_reads, snapshot_hydration_time_us
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND method = "PAIR_RESOLUTION" AND word = ["to_corridor"]
                  AND length = 1 AND best_support_size = 1
                  AND worst_support_size = 1 AND branch_count = 2
                  AND homing AND generation = 1
                  AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+                 AND cache_state = "BYPASSED" AND snapshot_record_reads = 0
                  AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
                  AND oracle_cache_hits = 0
+                 AND snapshot_hydration_time_us = 0
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "uncached planning leaves auxiliary graph empty" '
@@ -163,16 +169,25 @@ CALL sync.plan_sync(
 YIELD status, outcome, method, word, length, final_state_key,
       final_support_size, generation, oracle_source, oracle_builds,
       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
-      oracle_time_us, total_compute_time_us
+      cache_state, snapshot_record_reads, oracle_time_us,
+      snapshot_hydration_time_us, total_compute_time_us
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND method = "PAIR_MERGE"
                  AND word = ["to_corridor", "go_west"] AND length = 2
                  AND final_state_key = "dock:north"
                  AND final_support_size = 1 AND generation = 1
                  AND oracle_source = "PERSISTED" AND oracle_builds = 0
-                 AND oracle_rows_loaded > 0 AND oracle_rows_loaded < 15
-                 AND oracle_load_batches > 0 AND oracle_cache_hits >= 0
+                 AND cache_state = "HOT" AND oracle_rows_loaded = 0
+                 AND oracle_load_batches = 0 AND snapshot_record_reads > 0
+                 AND oracle_cache_hits = snapshot_record_reads
+                 AND snapshot_hydration_time_us = 0
                  AND oracle_time_us >= 0 AND total_compute_time_us >= oracle_time_us
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "force a cold snapshot lookup" '
+MATCH (m:SyncModel {model: "warehouse"})
+SET m.snapshot_token = "integration-hydration-epoch-1"
+RETURN CASE WHEN m.snapshot_token = "integration-hydration-epoch-1"
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "disambiguation plan" '
@@ -181,15 +196,18 @@ CALL sync.plan_disambiguate(
 YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation,
       oracle_source, oracle_builds, oracle_rows_loaded,
-      oracle_load_batches, oracle_cache_hits
+      oracle_load_batches, oracle_cache_hits, cache_state,
+      snapshot_record_reads, snapshot_hydration_time_us
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND method = "PAIR_RESOLUTION" AND word = ["to_corridor"]
                  AND length = 1 AND best_support_size = 1
                  AND worst_support_size = 1 AND branch_count = 2
                  AND homing AND generation = 1
                  AND oracle_source = "PERSISTED" AND oracle_builds = 0
-                 AND oracle_rows_loaded > 0 AND oracle_rows_loaded < 15
-                 AND oracle_load_batches > 0 AND oracle_cache_hits >= 0
+                 AND cache_state = "HYDRATED" AND oracle_rows_loaded = 15
+                 AND oracle_load_batches = 1 AND snapshot_record_reads > 0
+                 AND oracle_cache_hits = snapshot_record_reads
+                 AND snapshot_hydration_time_us >= 0
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "plan explanation" '
@@ -320,7 +338,9 @@ RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 run_query '
-MATCH (p:SyncPair {model: "warehouse"}) DETACH DELETE p;'
+MATCH (p:SyncPair {model: "warehouse"}) DETACH DELETE p;
+MATCH (m:SyncModel {model: "warehouse"})
+SET m.snapshot_token = "integration-missing-pairs";'
 
 expect_failure "cached planning requires pair records" '
 CALL sync.plan_sync(
@@ -348,19 +368,17 @@ YIELD status, generation, oracle_epoch, pairs, pair_edges,
       materialized_pair_edges, incremental_enabled
 RETURN CASE WHEN status = "OK" AND generation = 2 AND oracle_epoch = 3
                  AND pairs = 15 AND pair_edges = 60
-                 AND materialized_pair_edges AND incremental_enabled
+                 AND NOT materialized_pair_edges AND incremental_enabled
             THEN "PASS" ELSE "FAIL" END AS result;'
 
-assert_pass "incremental oracle stores forward edges only" '
+assert_pass "compact incremental oracle stores records only" '
 MATCH (p:SyncPair {model: "warehouse", oracle_epoch: 3})
 WITH count(p) AS pairs
-OPTIONAL MATCH (:SyncPair {model: "warehouse", oracle_epoch: 3})
-               -[n:PAIR_NEXT {model: "warehouse", oracle_epoch: 3}]->
-               (:SyncPair {model: "warehouse", oracle_epoch: 3})
-WITH pairs, count(n) AS next_edges
-OPTIONAL MATCH ()-[p:PAIR_PRE {model: "warehouse", oracle_epoch: 3}]->()
-WITH pairs, next_edges, count(p) AS pre_edges
-RETURN CASE WHEN pairs = 15 AND next_edges = 60 AND pre_edges = 0
+OPTIONAL MATCH ()-[edge:PAIR_NEXT|PAIR_PRE {
+  model: "warehouse", oracle_epoch: 3
+}]->()
+WITH pairs, count(edge) AS edges
+RETURN CASE WHEN pairs = 15 AND edges = 0
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "incremental no-op preserves generation" '
@@ -369,11 +387,16 @@ CALL sync.update_cells("warehouse", [{
   action_key: "to_wall",
   output_key: "symmetric"
 }], 15)
-YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
-      pair_records_touched, fallback_rebuild
+YIELD status, maintenance_mode, generation, oracle_epoch, changed_cells,
+      direct_pair_edges, pair_records_touched, pair_records_examined,
+      pair_records_written, pair_edges_examined, db_write_batches,
+      fallback_rebuild
 RETURN CASE WHEN status = "UNCHANGED" AND generation = 2 AND oracle_epoch = 3
+                 AND maintenance_mode = "UNCHANGED"
                  AND changed_cells = 0 AND direct_pair_edges = 0
-                 AND pair_records_touched = 0 AND NOT fallback_rebuild
+                 AND pair_records_touched = 0 AND pair_records_examined = 0
+                 AND pair_records_written = 0 AND pair_edges_examined = 0
+                 AND db_write_batches = 0 AND NOT fallback_rebuild
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "incremental local repair" '
@@ -382,25 +405,30 @@ CALL sync.update_cells("warehouse", [{
   action_key: "to_wall",
   output_key: "east_landmark"
 }], 15)
-YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
-      pair_records_touched, fallback_rebuild, maintenance_time_us
+YIELD status, maintenance_mode, generation, oracle_epoch, changed_cells,
+      direct_pair_edges, pair_records_touched, pair_records_examined,
+      pair_records_written, pair_edges_examined, db_write_batches,
+      fallback_rebuild, maintenance_time_us
 RETURN CASE WHEN status = "UPDATED" AND generation = 3 AND oracle_epoch = 3
+                 AND maintenance_mode = "INCREMENTAL"
                  AND changed_cells = 1 AND direct_pair_edges = 5
                  AND pair_records_touched >= 4 AND pair_records_touched <= 15
+                 AND pair_records_examined >= pair_records_touched
+                 AND pair_records_written > 0 AND pair_records_written < 15
+                 AND pair_edges_examined > 0 AND db_write_batches >= 2
                  AND NOT fallback_rebuild AND maintenance_time_us >= 0
             THEN "PASS" ELSE "FAIL" END AS result;'
 
-assert_pass "local repair advances only affected edge generation" '
+assert_pass "compact repair leaves pair relationships absent" '
 MATCH (m:SyncModel {model: "warehouse"})
-OPTIONAL MATCH ()-[n:PAIR_NEXT {
-  model: "warehouse", oracle_epoch: 3, updated_generation: 3
+OPTIONAL MATCH ()-[edge:PAIR_NEXT|PAIR_PRE {
+  model: "warehouse", oracle_epoch: 3
 }]->()
-WITH m, count(n) AS updated_edges
-OPTIONAL MATCH ()-[p:PAIR_PRE {model: "warehouse", oracle_epoch: 3}]->()
-WITH m, updated_edges, count(p) AS pre_edges
+WITH m, count(edge) AS edges
 RETURN CASE WHEN NOT m.dirty AND m.generation = 3
                  AND m.prepared_generation = 3 AND m.oracle_epoch = 3
-                 AND m.incremental AND updated_edges = 5 AND pre_edges = 0
+                 AND m.incremental AND NOT m.pair_edges_materialized
+                 AND edges = 0
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "cached plan after local repair" '
@@ -452,11 +480,14 @@ CALL sync.update_cells("warehouse", [{
   action_key: "to_wall",
   output_key: "symmetric"
 }], 1)
-YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
-      pair_records_touched, fallback_rebuild
+YIELD status, maintenance_mode, generation, oracle_epoch, changed_cells,
+      direct_pair_edges, pair_records_touched, pair_records_written,
+      fallback_rebuild
 RETURN CASE WHEN status = "UPDATED" AND generation = 4 AND oracle_epoch = 3
+                 AND maintenance_mode = "FULL_REBUILD"
                  AND changed_cells = 1 AND direct_pair_edges = 5
-                 AND pair_records_touched = 15 AND fallback_rebuild
+                 AND pair_records_touched = 15 AND pair_records_written = 15
+                 AND fallback_rebuild
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "cached plan after fallback rebuild" '
@@ -485,6 +516,53 @@ CALL sync.validate_update(
 YIELD status, decision, generation
 RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION"
                  AND generation = 4
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "prepare visual incremental oracle" '
+CALL sync.prepare_model("warehouse", true, true)
+YIELD status, generation, oracle_epoch, pairs, pair_edges,
+      materialized_pair_edges, incremental_enabled
+RETURN CASE WHEN status = "OK" AND generation = 4 AND oracle_epoch = 4
+                 AND pairs = 15 AND pair_edges = 60
+                 AND materialized_pair_edges AND incremental_enabled
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "visual incremental oracle stores both edge directions" '
+MATCH (p:SyncPair {model: "warehouse", oracle_epoch: 4})
+WITH count(p) AS pairs
+OPTIONAL MATCH ()-[next:PAIR_NEXT {model: "warehouse", oracle_epoch: 4}]->()
+WITH pairs, count(next) AS next_edges
+OPTIONAL MATCH ()-[pre:PAIR_PRE {model: "warehouse", oracle_epoch: 4}]->()
+WITH pairs, next_edges, count(pre) AS pre_edges
+RETURN CASE WHEN pairs = 15 AND next_edges = 60 AND pre_edges = 60
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "visual incremental repair updates both edge directions" '
+CALL sync.update_cells("warehouse", [{
+  state_key: "west_bay:east",
+  action_key: "to_wall",
+  output_key: "west_landmark"
+}], 15)
+YIELD status, maintenance_mode, generation, oracle_epoch, changed_cells,
+      direct_pair_edges, fallback_rebuild
+RETURN CASE WHEN status = "UPDATED" AND maintenance_mode = "INCREMENTAL"
+                 AND generation = 5 AND oracle_epoch = 4 AND changed_cells = 1
+                 AND direct_pair_edges = 5 AND NOT fallback_rebuild
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "visual edge generations advance together" '
+MATCH (m:SyncModel {model: "warehouse"})
+OPTIONAL MATCH ()-[next:PAIR_NEXT {
+  model: "warehouse", oracle_epoch: 4, updated_generation: 5
+}]->()
+WITH m, count(next) AS updated_next
+OPTIONAL MATCH ()-[pre:PAIR_PRE {
+  model: "warehouse", oracle_epoch: 4, updated_generation: 5
+}]->()
+WITH m, updated_next, count(pre) AS updated_pre
+RETURN CASE WHEN m.generation = 5 AND m.prepared_generation = 5
+                 AND m.pair_edges_materialized AND updated_next = 5
+                 AND updated_pre = 5
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 echo "Memgraph integration test passed"

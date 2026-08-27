@@ -135,6 +135,7 @@ measure_call() {
   source="$2"
   procedure="$3"
   expected_builds="$4"
+  expected_cache="$5"
   if [ "$planner" = "sync" ]; then
     query="
 CALL sync.$procedure(
@@ -142,7 +143,8 @@ CALL sync.$procedure(
 YIELD status, outcome, method, word, length, final_state_key,
       final_support_size, generation, oracle_source, oracle_builds,
       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
-      oracle_time_us, total_compute_time_us
+      cache_state, snapshot_record_reads, oracle_time_us,
+      snapshot_hydration_time_us, total_compute_time_us
 RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
                  AND method = \"PAIR_MERGE\" AND word = [\"a0\"]
                  AND length = 1 AND final_state_key = \"s104\"
@@ -150,16 +152,22 @@ RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
                  AND oracle_source = \"$source\"
                  AND oracle_builds = $expected_builds
                  AND (($expected_builds = 0
-                       AND oracle_rows_loaded > 0 AND oracle_rows_loaded < 22155
-                       AND oracle_load_batches > 0 AND oracle_cache_hits >= 0)
+                       AND cache_state = \"$expected_cache\"
+                       AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
+                       AND snapshot_record_reads > 0
+                       AND oracle_cache_hits = snapshot_record_reads
+                       AND snapshot_hydration_time_us = 0)
                       OR ($expected_builds = 1
+                          AND cache_state = \"$expected_cache\"
                           AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
-                          AND oracle_cache_hits = 0))
+                          AND oracle_cache_hits = 0 AND snapshot_record_reads = 0
+                          AND snapshot_hydration_time_us = 0))
                  AND oracle_time_us >= 0
                  AND total_compute_time_us >= oracle_time_us
             THEN \"PASS\" ELSE \"FAIL\" END AS result,
        oracle_time_us, total_compute_time_us,
-       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits;"
+       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
+       snapshot_record_reads, snapshot_hydration_time_us;"
   else
     query="
 CALL sync.$procedure(
@@ -168,7 +176,8 @@ YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation,
       oracle_source, oracle_builds, oracle_rows_loaded,
       oracle_load_batches, oracle_cache_hits,
-      oracle_time_us, total_compute_time_us
+      cache_state, snapshot_record_reads, oracle_time_us,
+      snapshot_hydration_time_us, total_compute_time_us
 RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
                  AND method = \"PAIR_RESOLUTION\" AND word = [\"a0\"]
                  AND length = 1 AND best_support_size = 1
@@ -176,16 +185,22 @@ RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
                  AND generation = 1 AND oracle_source = \"$source\"
                  AND oracle_builds = $expected_builds
                  AND (($expected_builds = 0
-                       AND oracle_rows_loaded > 0 AND oracle_rows_loaded < 22155
-                       AND oracle_load_batches > 0 AND oracle_cache_hits >= 0)
+                       AND cache_state = \"$expected_cache\"
+                       AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
+                       AND snapshot_record_reads > 0
+                       AND oracle_cache_hits = snapshot_record_reads
+                       AND snapshot_hydration_time_us = 0)
                       OR ($expected_builds = 1
+                          AND cache_state = \"$expected_cache\"
                           AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
-                          AND oracle_cache_hits = 0))
+                          AND oracle_cache_hits = 0 AND snapshot_record_reads = 0
+                          AND snapshot_hydration_time_us = 0))
                  AND oracle_time_us >= 0
                  AND total_compute_time_us >= oracle_time_us
             THEN \"PASS\" ELSE \"FAIL\" END AS result,
        oracle_time_us, total_compute_time_us,
-       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits;"
+       oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
+       snapshot_record_reads, snapshot_hydration_time_us;"
   fi
   measured=$(run_query "$query") || {
     echo "ablation call failed: $planner $source" >&2
@@ -193,17 +208,17 @@ RETURN CASE WHEN status = \"OK\" AND outcome = \"PLAN\"
   }
   parsed=$(printf '%s\n' "$measured" | awk -F, '
     END {
-      for (field = 1; field <= 6; ++field) {
+      for (field = 1; field <= 8; ++field) {
         gsub(/"/, "", $field)
       }
-      print $1, $2, $3, $4, $5, $6
+      print $1, $2, $3, $4, $5, $6, $7, $8
     }')
   set -- $parsed
-  if [ "$#" -ne 6 ] || [ "$1" != "PASS" ]; then
+  if [ "$#" -ne 8 ] || [ "$1" != "PASS" ]; then
     printf '%s\n' "ablation result mismatch: $planner $source" "$measured" >&2
     exit 1
   fi
-  printf '%s %s %s %s %s\n' "$2" "$3" "$4" "$5" "$6"
+  printf '%s %s %s %s %s %s %s\n' "$2" "$3" "$4" "$5" "$6" "$7" "$8"
 }
 
 median() {
@@ -215,36 +230,44 @@ run_mode() {
   source="$2"
   procedure="$3"
   expected_builds="$4"
+  expected_cache="$5"
   oracle_file="$tmpdir/$planner-$source-oracle"
   total_file="$tmpdir/$planner-$source-total"
   rows_file="$tmpdir/$planner-$source-rows"
   batches_file="$tmpdir/$planner-$source-batches"
   hits_file="$tmpdir/$planner-$source-hits"
+  reads_file="$tmpdir/$planner-$source-reads"
+  hydration_file="$tmpdir/$planner-$source-hydration"
 
-  measure_call "$planner" "$source" "$procedure" "$expected_builds" >/dev/null
+  measure_call "$planner" "$source" "$procedure" "$expected_builds" \
+    "$expected_cache" >/dev/null
   for run in 1 2 3 4 5 6 7; do
-    measured=$(measure_call "$planner" "$source" "$procedure" "$expected_builds")
+    measured=$(measure_call "$planner" "$source" "$procedure" "$expected_builds" \
+      "$expected_cache")
     set -- $measured
     printf '%s\n' "$1" >>"$oracle_file"
     printf '%s\n' "$2" >>"$total_file"
     printf '%s\n' "$3" >>"$rows_file"
     printf '%s\n' "$4" >>"$batches_file"
     printf '%s\n' "$5" >>"$hits_file"
+    printf '%s\n' "$6" >>"$reads_file"
+    printf '%s\n' "$7" >>"$hydration_file"
   done
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$planner" "$source" "$runs" "$expected_builds" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$planner" "$source" "$expected_cache" "$runs" "$expected_builds" \
     "$(median "$oracle_file")" "$(median "$total_file")" \
     "$(median "$rows_file")" "$(median "$batches_file")" \
-    "$(median "$hits_file")" >>"$output"
+    "$(median "$hits_file")" "$(median "$reads_file")" \
+    "$(median "$hydration_file")" >>"$output"
 }
 
 printf '%s\n' \
-  'planner,oracle_source,runs,oracle_builds_per_call,median_oracle_time_us,median_total_compute_time_us,median_oracle_rows_loaded,median_oracle_load_batches,median_oracle_cache_hits' \
+  'planner,oracle_source,cache_state,runs,oracle_builds_per_call,median_oracle_time_us,median_total_compute_time_us,median_oracle_rows_loaded,median_oracle_load_batches,median_oracle_cache_hits,median_snapshot_record_reads,median_snapshot_hydration_time_us' \
   >"$output"
-run_mode sync PERSISTED plan_sync 0
-run_mode sync RECOMPUTED plan_sync_uncached 1
-run_mode homing PERSISTED plan_disambiguate 0
-run_mode homing RECOMPUTED plan_disambiguate_uncached 1
+run_mode sync PERSISTED plan_sync 0 HOT
+run_mode sync RECOMPUTED plan_sync_uncached 1 BYPASSED
+run_mode homing PERSISTED plan_disambiguate 0 HOT
+run_mode homing RECOMPUTED plan_disambiguate_uncached 1 BYPASSED
 
 run_query '
 CREATE (:SyncModel {
@@ -307,7 +330,7 @@ YIELD status, generation, oracle_epoch, states, actions, pairs, pair_edges,
 RETURN CASE WHEN status = "OK" AND generation = 1 AND oracle_epoch = 1
                  AND states = 24 AND actions = 5
                  AND pairs = 300 AND pair_edges = 1500
-                 AND materialized_pair_edges AND incremental_enabled
+                 AND NOT materialized_pair_edges AND incremental_enabled
             THEN "PASS" ELSE "FAIL" END AS result;')
 if ! printf '%s\n' "$update_prepared" | grep -q 'PASS'; then
   printf '%s\n' "failed to prepare update ablation fixture" \
@@ -320,49 +343,61 @@ measure_update() {
   output_key="$2"
   budget="$3"
   expected_generation="$4"
-  expected_fallback="$5"
+  expected_mode="$5"
+  expected_fallback="$6"
   measured=$(run_query "
 CALL sync.update_cells(\"sync_kgraph_update_ablation\", [{
   state_key: \"s0\", action_key: \"a4\", output_key: \"$output_key\"
 }], $budget)
-YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
-      pair_records_touched, fallback_rebuild, maintenance_time_us
+YIELD status, maintenance_mode, generation, oracle_epoch, changed_cells,
+      direct_pair_edges, pair_records_touched, pair_records_examined,
+      pair_records_written, pair_edges_examined, db_write_batches,
+      fallback_rebuild, maintenance_time_us
 RETURN CASE WHEN status = \"UPDATED\" AND generation = $expected_generation
                  AND oracle_epoch = 1 AND changed_cells = 1
                  AND direct_pair_edges = 24
-                 AND (($expected_fallback
-                       AND pair_records_touched = 300 AND fallback_rebuild)
-                      OR (NOT $expected_fallback
+                 AND maintenance_mode = \"$expected_mode\"
+                 AND fallback_rebuild = $expected_fallback
+                 AND ((maintenance_mode = \"FULL_REBUILD\"
+                       AND pair_records_touched = 300
+                       AND pair_records_written = 300)
+                      OR (maintenance_mode = \"INCREMENTAL\"
                           AND pair_records_touched >= 23
                           AND pair_records_touched < 300
-                          AND NOT fallback_rebuild))
+                          AND pair_records_written > 0
+                          AND pair_records_written < 300))
+                 AND pair_records_examined >= pair_records_touched
+                 AND pair_edges_examined > 0 AND db_write_batches >= 2
             THEN \"PASS\" ELSE \"FAIL\" END AS result,
-       generation, changed_cells, direct_pair_edges, pair_records_touched,
-       fallback_rebuild, maintenance_time_us;") || {
+       maintenance_mode, generation, changed_cells, direct_pair_edges,
+       pair_records_touched, pair_records_examined, pair_records_written,
+       pair_edges_examined, db_write_batches, fallback_rebuild,
+       maintenance_time_us;") || {
     echo "update ablation call failed: $label" >&2
     exit 1
   }
   parsed=$(printf '%s\n' "$measured" | awk -F, '
     END {
-      for (field = 1; field <= 7; ++field) {
+      for (field = 1; field <= 12; ++field) {
         gsub(/"/, "", $field)
       }
-      print $1, $2, $3, $4, $5, $6, $7
+      print $1, $2, $3, $4, $5, $6, $7, $8, $9, $(10), $(11), $(12)
     }')
   set -- $parsed
-  if [ "$#" -ne 7 ] || [ "$1" != "PASS" ]; then
+  if [ "$#" -ne 12 ] || [ "$1" != "PASS" ]; then
     printf '%s\n' "update ablation result mismatch: $label" "$measured" >&2
     exit 1
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s\n' \
-    "$label" "$2" "$3" "$4" "$5" "$6" "$7" >>"$update_output"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$label" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" \
+    "${11}" "${12}" >>"$update_output"
 }
 
 printf '%s\n' \
-  'mode,generation,changed_cells,direct_pair_edges,pair_records_touched,fallback_rebuild,maintenance_time_us' \
+  'mode,maintenance_mode,generation,changed_cells,direct_pair_edges,pair_records_touched,pair_records_examined,pair_records_written,pair_edges_examined,db_write_batches,fallback_rebuild,maintenance_time_us' \
   >"$update_output"
-measure_update local_repair o1 300 2 false
-measure_update fallback_rebuild o0 1 3 true
+measure_update local_repair o1 300 2 INCREMENTAL false
+measure_update forced_full_rebuild o0 -1 3 FULL_REBUILD false
 
 post_update_plans=$(run_query '
 CALL sync.plan_sync(
@@ -403,7 +438,8 @@ RETURN CASE WHEN NOT planner.dirty AND planner.generation = 1
                  AND NOT updated.dirty AND updated.generation = 3
                  AND updated.prepared_generation = 3
                  AND updated.oracle_epoch = 1 AND updated.incremental
-                 AND update_pairs = 300 AND update_edges = 1500
+                 AND NOT updated.pair_edges_materialized
+                 AND update_pairs = 300 AND update_edges = 0
             THEN "PASS" ELSE "FAIL" END AS result;')
 if ! printf '%s\n' "$graph_state" | grep -q 'PASS'; then
   printf '%s\n' "ablation calls changed the prepared graph" "$graph_state" >&2

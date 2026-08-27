@@ -1,38 +1,36 @@
 # sync-kgraph
 
-`sync-kgraph` implements the synchronize-or-reveal algorithms from the
-companion paper as a C23 library and a native Memgraph query module. It treats a
-manually mapped knowledge-graph view as a deterministic Mealy automaton and can:
+`sync-kgraph` exposes synchronize-or-reveal algorithms as a C23 library and a
+native Memgraph query module. A manually mapped graph view represents a
+deterministic Mealy automaton. The module can then:
 
-- validate complete transition and observation functions;
-- build and persist an epoch-scoped pair merge/resolution oracle;
-- lazily read only the persisted witnesses needed by a plan;
-- atomically repair pair witnesses after transition or observation changes;
-- recompute the oracle from the base view for cache-free ablation;
-- plan an open-loop word that synchronizes a hypothesis set;
-- plan an output-partitioning word that reveals the current hypothesis;
-- fall back to exact bounded partition BFS when a pair witness is insufficient;
-- explain predicted supports and output branches after every action; and
-- monitor localization updates as `CONTINUE`, `REPLAN`, `MODEL_VIOLATION`,
-  `STALE_GENERATION`, or `WAIT`.
+- find a word that brings every current hypothesis to one state;
+- find a homing word whose outputs distinguish the current hypothesis;
+- explain predicted states and output branches after each action;
+- validate localization updates and detect stale plans; and
+- maintain prepared planning data after transition or observation changes.
 
-All algorithm and Memgraph module code is C23. Cypher is used only for schema,
-mapping, and example queries. Meson builds the library, CLI, tests, and optional
-Memgraph module.
+Cypher is used only for schema, mapping, and queries. The mapping is manual so
+the database owner controls how application entities, actions, and observations
+become an automaton.
 
-## Build And Test
+## Choose A Planning Mode
 
-Core build:
+| Need | API | Preparation | Intended use |
+| --- | --- | --- | --- |
+| Repeated low-latency plans | `plan_sync`, `plan_disambiguate` | `prepare_model(..., false, false)` | Read-mostly models |
+| Frequent small model changes | Cached planners plus `update_cells` | `prepare_model(..., false, true)` | Incrementally maintained models |
+| A baseline or one-off plan | `plan_sync_uncached`, `plan_disambiguate_uncached` | None | Rebuilds from the base view on every call |
+| Inspect pair transitions in Memgraph Lab | Any cached mode | Set `materialize_pair_edges` to `true` | Visualization only; it does not accelerate planning |
 
-```sh
-CC=clang meson setup build -Dmemgraph=disabled
-meson compile -C build
-meson test -C build --print-errorlogs
-./build/sync-kgraph-cli --example warehouse
-```
+Cached and uncached planners return the same semantic result for the same model
+generation. The cached path is optimized for repeated calls; the uncached path
+is intentionally retained for controlled comparisons and simple one-off use.
 
-Build the native module against the header installed with the target Memgraph
-server. This is preferred over using a header from a different release:
+## Build And Install
+
+Build the native module against the C header installed with the target Memgraph
+server. Using the server's own header avoids C API version mismatches:
 
 ```sh
 CC=clang meson setup build-memgraph \
@@ -42,8 +40,8 @@ meson compile -C build-memgraph
 ```
 
 The Linux artifact is `build-memgraph/sync.so`; macOS produces the native
-shared-module equivalent. Install with Meson, or place that file in the
-server's query-module directory and load it:
+shared-module equivalent. Place it in the server's query-module directory, or
+install it with Meson, and load it:
 
 ```cypher
 CALL mg.load("sync");
@@ -67,27 +65,17 @@ sync.update_cells
 sync.validate_update
 ```
 
-Run the local integration test with an already installed Memgraph:
+Prebuilt releases contain Linux x86_64 and native macOS arm64 binaries, the C
+header and static library, Cypher scripts, the warehouse example, and the
+Memgraph Lab view.
 
-```sh
-sh scripts/memgraph_local_smoke.sh build-memgraph
-```
-
-It starts a separate Memgraph process on a temporary port with private data,
-log, and module directories. It never connects to or modifies the normal
-Memgraph instance on port 7687. It also writes the representative ablation
-timings to `build-memgraph/ablation.csv` and
-`build-memgraph/ablation-updates.csv`.
-
-## Manual View Contract
+## Map A Model
 
 Run `cypher/install_schema.cypher` once. The application schema is otherwise
 untouched. Create dedicated view nodes and relationships for each model:
 
 ```cypher
-(:SyncModel {
-  model, generation, dirty, prepared_generation?, oracle_epoch?, incremental?
-})
+(:SyncModel {model, generation, dirty})
 (:SyncState {
   model, state_key, state_id?, semantic_ref?, orientation?
 })
@@ -110,6 +98,10 @@ there must be exactly one `SYNC_TRANS` and one `SYNC_OBS`. An observation is the
 output emitted for the source state and selected action. Optional numeric IDs
 only control stable ordering; keys are the public interface.
 
+`prepared_generation`, `oracle_epoch`, `incremental`,
+`pair_edges_materialized`, and `snapshot_token` are managed by the module. The
+application should not write them directly.
+
 The mapping is deliberately manual because only the database owner knows how
 application entities, orientations, commands, and sensor abstractions form the
 automaton. Prefer separate `SyncState` nodes linked by `semantic_ref` or an
@@ -125,51 +117,9 @@ After creating the view:
 3. Store the returned generation with every plan.
 4. Reject or replan work when monitor output is `STALE_GENERATION`.
 
-`prepare_model` validates the strict Mealy model and always persists one
-`SyncPair` record for every unordered pair with repetition. Passing `true` for
-`materialize_pair_edges` also persists `PAIR_NEXT` and `PAIR_PRE` relationships
-for inspection. Incremental mode persists `PAIR_NEXT` because repair needs the
-forward pair graph; it does not persist redundant `PAIR_PRE` relationships.
-The two booleans cannot both be true.
-
-| `materialize_pair_edges` | `incremental` | Persisted auxiliary state |
-| --- | --- | --- |
-| `false` | `false` | `SyncPair` records only |
-| `true` | `false` | `SyncPair`, `PAIR_NEXT`, and `PAIR_PRE` |
-| `false` | `true` | `SyncPair` and `PAIR_NEXT` |
-
-`oracle_epoch` identifies a complete compatible auxiliary graph. Generation
-advances after each effective base-view change, while the epoch remains stable
-across successful incremental repairs. Repreparing replaces the auxiliary graph
-and advances the epoch.
-
-Preparation and plan reads follow this lifecycle:
-
-```mermaid
-flowchart LR
-  subgraph DB["Memgraph"]
-    V["Manual Mealy view<br/>SYNC_TRANS + SYNC_OBS"]
-    R["SyncPair records<br/>witnesses + support counts"]
-    E["Optional PAIR_NEXT + PAIR_PRE<br/>visual snapshot"]
-    I["PAIR_NEXT<br/>incremental mode"]
-  end
-
-  P["prepare_model"]
-  V --> P
-  P --> R
-  P -. "visual mode" .-> E
-  P -. "incremental mode" .-> I
-
-  Q["plan_sync / plan_disambiguate"] --> V
-  Q --> L["Batch-load only required<br/>SyncPair records"]
-  R --> L
-  L --> W["Follow canonical<br/>witness chain"]
-  W --> O["Word + generation"]
-
-  U["uncached planner"] --> V
-  V --> B["Build transient full oracle"]
-  B --> O
-```
+`prepare_model` validates the complete Mealy model and creates the derived pair
+records used by cached planning. `PAIR_NEXT` and `PAIR_PRE` are optional
+inspection relationships; planning never requires them.
 
 The trigger file is a template, not a generic installed trigger. Adapt its
 predicate to the application labels and relationships that feed each model. A
@@ -177,9 +127,9 @@ schema-agnostic trigger cannot identify the affected model safely. Exclude
 writes made by `update_cells` because that procedure handles generation and
 repair atomically.
 
-## Procedure Interface
+## Procedure API
 
-### Persisted Planning API
+### Prepared Planning
 
 ```cypher
 CALL sync.prepare_model(
@@ -188,12 +138,25 @@ CALL sync.plan_sync(model, hypotheses, budget)
 CALL sync.plan_disambiguate(model, hypotheses, bound, budget)
 ```
 
-The cached planners require a clean prepared model. They read the
-required epoch-scoped witnesses lazily from `SyncPair` in batched reads instead
-of loading every pair or rerunning the merge and resolution searches. Snapshot
-planners do not read `PAIR_NEXT` or `PAIR_PRE`.
+The cached planners require a clean prepared model. They are the normal choice
+when the same model will be queried repeatedly. The first call after a module
+restart or cache eviction reports `cache_state: "HYDRATED"`; subsequent calls
+normally report `"HOT"`.
 
-### Incremental Maintenance API
+The preparation options are independent:
+
+| `materialize_pair_edges` | `incremental` | Behavior |
+| --- | --- | --- |
+| `false` | `false` | Prepared planning with compact pair records |
+| `true` | `false` | Also create `PAIR_NEXT` and `PAIR_PRE` for inspection |
+| `false` | `true` | Compact pair records maintained by `update_cells` |
+| `true` | `true` | Incremental maintenance plus inspection relationships |
+
+The process cache defaults to 512 MiB. Set `SYNC_KGRAPH_CACHE_MAX_BYTES` to a
+decimal byte limit, or `0` to disable retention. Durable pair records remain
+available when retention is disabled.
+
+### Incremental Updates
 
 ```cypher
 CALL sync.prepare_model(model, false, true)
@@ -201,43 +164,26 @@ CALL sync.update_cells(model, changes, repair_budget = 0)
 ```
 
 Each change is a map containing `state_key`, `action_key`, and at least one of
-`target_key` or `output_key`. The procedure validates the entire nonempty batch
-before writing, updates `SYNC_TRANS` and `SYNC_OBS`, replaces the affected
-`PAIR_NEXT` entries, and repairs merge and resolution witnesses in one
-transaction. Duplicate cells and unknown keys are rejected. A batch containing
-only current values returns `UNCHANGED` without advancing generation.
+`target_key` or `output_key`. The complete nonempty batch is validated before
+anything is written. Duplicate cells and unknown keys are rejected. A batch
+containing only current values returns `UNCHANGED` without advancing the model
+generation.
 
-`repair_budget = 0` uses `ceil(pair_count / 4)`. If repair touches more records
-than the budget, the procedure rebuilds all pair records in the same transaction
-and returns `fallback_rebuild: true`. This preserves exact results and puts a
-bound on incremental work. The update result reports changed cells, directly
-changed pair edges, touched pair records, invalidations, fallback use, and
-maintenance time.
+Updates change the base view and its prepared records in one transaction.
+Incremental mode is optimized for small batches; if the affected region grows
+too large, it falls back to an exact full rebuild. Optional `PAIR_NEXT` and
+`PAIR_PRE` relationships are updated only when materialization was enabled.
 
-This is DynFO-inspired incremental maintenance, not a claim of formal DynFO
-dynamic complexity: the C repair engine maintains witnesses and support counts
-over the stored pair graph, but Memgraph queries, transaction work, and a
-bounded full-rebuild fallback remain part of the implementation.
+`repair_budget = 0` uses `ceil(pair_count / 4)`. A positive value is an explicit
+touch budget. If repair exceeds it, the procedure rebuilds all pair records and
+returns `fallback_rebuild: true`. Passing `-1` requests a full rebuild directly;
+this is intended for controlled comparisons, not normal operation.
 
-An incremental update stays inside one write transaction:
+The result reports `maintenance_mode` (`UNCHANGED`, `INCREMENTAL`, or
+`FULL_REBUILD`), direct pair deltas, records touched/examined/written, pair edges
+examined, database write batches, invalidations, fallback use, and elapsed time.
 
-```mermaid
-flowchart TD
-  U["update_cells batch"] --> V{"Entire batch valid?"}
-  V -- "no" --> X["Error; transaction rolls back"]
-  V -- "yes" --> N{"Any effective change?"}
-  N -- "no" --> Z["UNCHANGED<br/>generation and epoch stay fixed"]
-  N -- "yes" --> B["Rewrite affected<br/>SYNC_TRANS / SYNC_OBS cells"]
-  B --> E["Replace affected<br/>PAIR_NEXT edges"]
-  E --> R["Repair witnesses and<br/>optimal support counts"]
-  R --> C{"Touched records<br/>within budget?"}
-  C -- "yes" --> K["Commit local repair"]
-  C -- "no" --> F["Rebuild all SyncPair records"]
-  F --> K
-  K --> G["UPDATED<br/>generation + 1; epoch unchanged"]
-```
-
-### Uncached Ablation API
+### Uncached Planning
 
 ```cypher
 CALL sync.plan_sync_uncached(model, hypotheses, budget)
@@ -245,21 +191,13 @@ CALL sync.plan_disambiguate_uncached(model, hypotheses, bound, budget)
 ```
 
 The uncached planners validate the current base Mealy view and rebuild the pair
-oracle in transient C memory on every call. They work on dirty or unprepared
-models and never read or write `SyncPair`, `PAIR_NEXT`, `PAIR_PRE`, `dirty`, or
-`prepared_generation`. Their transient allocations are freed before the call
-returns.
+oracle in temporary C memory on every call. They work on dirty or unprepared
+models and do not create or modify auxiliary records. Use them for a one-off
+plan or as a cache-free reference; prepared planning is optimized for repeated
+calls.
 
-All three modes are available for controlled comparison:
-
-- uncached planning measures full reconstruction from the base view;
-- persisted planning measures lazy witness reads;
-- incremental maintenance measures repairing derived state after mutations.
-
-On the same generation, hypotheses, bound, and budget, cached and uncached
-semantic fields must match exactly. Persisted witnesses and local repair reduce
-recomputation or touched records, but they do not guarantee lower wall-clock
-latency for every graph. Database query overhead remains measurable.
+For the same generation, hypotheses, bound, and budget, cached and uncached
+semantic fields are identical.
 
 All four planner procedures additionally return:
 
@@ -267,19 +205,21 @@ All four planner procedures additionally return:
 | --- | --- | --- | --- |
 | `oracle_source` | `PERSISTED` | `RECOMPUTED` | Source of pair witnesses |
 | `oracle_builds` | `0` | `1` | Calls to the full oracle builder |
-| `oracle_rows_loaded` | Witness path rows | `0` | Pair records read from Memgraph |
-| `oracle_load_batches` | Batched reads | `0` | Pair-record queries |
-| `oracle_cache_hits` | Reused rows | `0` | In-call witness-cache hits |
-| `oracle_time_us` | Variable | Variable | Lazy record reads or rebuilding time |
+| `cache_state` | `HOT` or `HYDRATED` | `BYPASSED` | Process snapshot state |
+| `oracle_rows_loaded` | `0` hot; all pairs hydrated | `0` | Durable rows loaded this call |
+| `oracle_load_batches` | `0` hot; hydration batches | `0` | Pair-record queries |
+| `oracle_cache_hits` | Snapshot reads | `0` | Witness reads served in C |
+| `snapshot_record_reads` | Requested witnesses | `0` | Pair records read by the planner |
+| `snapshot_hydration_time_us` | Hydration time or `0` | `0` | Cold snapshot reconstruction |
+| `oracle_time_us` | Hydration time or `0` | Rebuild time | Oracle preparation work |
 | `total_compute_time_us` | Variable | Variable | Base-view extraction through planner completion |
 
-`planning_time_us` remains the time spent only in the core word planner.
-`total_compute_time_us` excludes result encoding, Bolt transport, and client
-latency. Timing fields and oracle metadata are excluded from semantic
-equivalence checks.
+`planning_time_us` covers only the word planner. `total_compute_time_us` covers
+model extraction through planner completion, excluding result encoding, Bolt
+transport, and client latency.
 
-Pair records created before this epoch schema do not contain support counts or
-`oracle_epoch`; re-run `prepare_model` after upgrading.
+After upgrading from a release whose pair records lack `oracle_epoch`, run
+`prepare_model` again.
 
 ### Supporting API
 
@@ -356,16 +296,16 @@ synchronizing word directly from the base view:
 CALL sync.plan_sync_uncached(
   "warehouse", ["west_bay:east", "east_bay:west"], 64)
 YIELD status, outcome, method, word, length, final_state_key,
-      final_support_size, generation, oracle_source, oracle_builds
+      final_support_size, generation, oracle_source, oracle_builds, cache_state
 RETURN status, outcome, method, word, length, final_state_key,
-       final_support_size, generation, oracle_source, oracle_builds;
+       final_support_size, generation, oracle_source, oracle_builds, cache_state;
 ```
 
 Expected:
 
 ```text
 "OK", "PLAN", "PAIR_MERGE", ["to_corridor", "go_west"], 2,
-"dock:north", 1, 1, "RECOMPUTED", 1
+"dock:north", 1, 1, "RECOMPUTED", 1, "BYPASSED"
 ```
 
 Compute the homing word through the same uncached path:
@@ -375,17 +315,17 @@ CALL sync.plan_disambiguate_uncached(
   "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
 YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation,
-      oracle_source, oracle_builds
+      oracle_source, oracle_builds, cache_state
 RETURN status, outcome, method, word, length, best_support_size,
        worst_support_size, branch_count, homing, generation,
-       oracle_source, oracle_builds;
+       oracle_source, oracle_builds, cache_state;
 ```
 
 Expected:
 
 ```text
 "OK", "PLAN", "PAIR_RESOLUTION", ["to_corridor"], 1,
-1, 1, 2, true, 1, "RECOMPUTED", 1
+1, 1, 2, true, 1, "RECOMPUTED", 1, "BYPASSED"
 ```
 
 Confirm that neither call materialized auxiliary graph data:
@@ -431,16 +371,16 @@ Because edge materialization was enabled, the graph contains 15 `SyncPair`, 60
 CALL sync.plan_sync(
   "warehouse", ["west_bay:east", "east_bay:west"], 64)
 YIELD status, outcome, method, word, length, final_state_key,
-      final_support_size, generation, oracle_source, oracle_builds
+      final_support_size, generation, oracle_source, oracle_builds, cache_state
 RETURN status, outcome, method, word, length, final_state_key,
-       final_support_size, generation, oracle_source, oracle_builds;
+       final_support_size, generation, oracle_source, oracle_builds, cache_state;
 ```
 
 Expected:
 
 ```text
 "OK", "PLAN", "PAIR_MERGE", ["to_corridor", "go_west"], 2,
-"dock:north", 1, 1, "PERSISTED", 0
+"dock:north", 1, 1, "PERSISTED", 0, "HOT"
 ```
 
 The semantic columns exactly match the uncached synchronization result. Only
@@ -453,17 +393,17 @@ CALL sync.plan_disambiguate(
   "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
 YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation,
-      oracle_source, oracle_builds
+      oracle_source, oracle_builds, cache_state
 RETURN status, outcome, method, word, length, best_support_size,
        worst_support_size, branch_count, homing, generation,
-       oracle_source, oracle_builds;
+       oracle_source, oracle_builds, cache_state;
 ```
 
 Expected:
 
 ```text
 "OK", "PLAN", "PAIR_RESOLUTION", ["to_corridor"], 1,
-1, 1, 2, true, 1, "PERSISTED", 0
+1, 1, 2, true, 1, "PERSISTED", 0, "HOT"
 ```
 
 The two bays emit different landmark outputs under `to_corridor`, so one
@@ -541,8 +481,8 @@ status: "OK", decision: "STALE_GENERATION", generation: 2
 
 ### 10. Prepare And Update Incrementally
 
-Prepare the dirty generation in incremental mode. This replaces the visual
-snapshot with one forward pair graph:
+Prepare the dirty generation in compact incremental mode. This keeps the
+derived graph compact and enables `update_cells`:
 
 ```cypher
 CALL sync.prepare_model("warehouse", false, true)
@@ -555,7 +495,7 @@ RETURN status, generation, oracle_epoch, pairs, pair_edges,
 Expected:
 
 ```text
-"OK", 2, 2, 15, 60, true, true
+"OK", 2, 2, 15, 60, false, true
 ```
 
 Change one observation cell:
@@ -566,21 +506,21 @@ CALL sync.update_cells("warehouse", [{
   action_key: "to_wall",
   output_key: "east_landmark"
 }], 15)
-YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
-      fallback_rebuild
-RETURN status, generation, oracle_epoch, changed_cells, direct_pair_edges,
-       fallback_rebuild;
+YIELD status, maintenance_mode, generation, oracle_epoch, changed_cells,
+      direct_pair_edges, fallback_rebuild
+RETURN status, maintenance_mode, generation, oracle_epoch, changed_cells,
+       direct_pair_edges, fallback_rebuild;
 ```
 
 Expected:
 
 ```text
-"UPDATED", 3, 2, 1, 5, false
+"UPDATED", "INCREMENTAL", 3, 2, 1, 5, false
 ```
 
-The five direct edges are the `to_wall` edges for the five unordered pairs
-containing `east_bay:west`. The epoch stays at 2 while generation advances.
-Repeating the same value is a no-op:
+The five direct deltas are the `to_wall` entries for the five unordered pairs
+containing `east_bay:west`. The epoch stays at 2 while generation advances, and
+no pair relationships are created. Repeating the same value is a no-op:
 
 ```cypher
 CALL sync.update_cells("warehouse", [{
@@ -602,54 +542,8 @@ Cached and uncached homing calls still return `["to_corridor"]` with generation
 3. An invalid key aborts the whole batch and leaves generation, base cells, and
 the oracle unchanged.
 
-## Quality And Releases
+## Developer Documentation
 
-Run the standalone Memgraph ablation suite against a loaded local module:
-
-```sh
-sh scripts/memgraph_ablation.sh build-memgraph/ablation.csv local
-```
-
-It constructs a temporary deterministic model with 210 states and 9 actions,
-representing 22,155 state pairs and 199,395 pair/action entries. After one
-warm-up call, it measures seven synchronization and seven homing calls for each
-oracle source. A second 24-state fixture performs one bounded local repair and
-one forced fallback rebuild. The command fails on semantic disagreement,
-incorrect oracle-source metrics, nonlocal direct-edge work, an unexpected
-fallback, or graph-contract failure, then removes both fixtures.
-
-Expected CSV columns:
-
-```text
-planner,oracle_source,runs,oracle_builds_per_call,median_oracle_time_us,median_total_compute_time_us,median_oracle_rows_loaded,median_oracle_load_batches,median_oracle_cache_hits
-```
-
-The companion `ablation-updates.csv` reports:
-
-```text
-mode,generation,changed_cells,direct_pair_edges,pair_records_touched,fallback_rebuild,maintenance_time_us
-```
-
-The deterministic work gates require persisted planners to load fewer than all
-pair rows, uncached planners to build exactly one oracle, local repair to touch
-fewer than 300 pair records, and forced fallback to rewrite all 300. Timing
-values are observations, not pass thresholds: fewer records can still take
-longer when database-query overhead dominates. CI uploads both CSV files as
-`memgraph-ablation-timings`.
-
-```sh
-sh scripts/check-format.sh
-sh scripts/run-clang-tidy.sh build-tidy
-sh scripts/valgrind.sh build-valgrind
-sh scripts/coverage.sh build-coverage /usr/include/memgraph
-```
-
-CI treats all Clang diagnostics as errors, runs every unit test under Valgrind
-with all leak kinds fatal, compiles against multiple Memgraph C API versions,
-and runs the full Memgraph integration and ablation contracts. Coverage
-includes every production C source file, including the CLI and Memgraph
-adapter, and fails below 75% line coverage.
-
-Release tags publish `linux-x86_64` and native `macos-arm64` archives. Each
-archive includes the CLI, C library and header, Memgraph module, Cypher mapping
-scripts, Memgraph Lab GSS view, worked example, license, and SHA-256 checksum.
+See [HACKING.md](HACKING.md) for the C snapshot architecture, cache and update
+lifecycle diagrams, correctness invariants, ablation benchmarks, quality gates,
+coverage policy, and release process.

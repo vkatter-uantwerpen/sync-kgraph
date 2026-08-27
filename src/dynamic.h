@@ -34,6 +34,9 @@ typedef struct {
 
 typedef struct {
   size_t pair_records_touched;
+  size_t pair_records_examined;
+  size_t pair_records_written;
+  size_t pair_edges_examined;
   size_t merge_pairs_changed;
   size_t merge_pairs_invalidated;
   size_t resolution_pairs_changed;

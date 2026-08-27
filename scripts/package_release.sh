@@ -28,7 +28,7 @@ elif [ -f "$builddir/sync.dylib" ]; then
   cp "$builddir/sync.dylib" "$stagedir/lib/"
 fi
 
-cp README.md LICENSE "$stagedir/"
+cp README.md HACKING.md LICENSE "$stagedir/"
 cp include/sync_kgraph/sync.h "$stagedir/include/sync_kgraph/"
 cp cypher/*.cypher "$stagedir/cypher/"
 cp -R examples/warehouse "$stagedir/examples/"

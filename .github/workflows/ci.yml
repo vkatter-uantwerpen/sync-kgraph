@@ -34,6 +34,14 @@ jobs:
         run: sh scripts/run-clang-tidy.sh build-tidy
       - name: CLI smoke
         run: ./build/sync-kgraph-cli --example warehouse
+      - name: Native incremental ablation gate
+        run: ./build/ablation_benchmark build/native-ablation.csv
+      - name: Upload native ablation timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-ablation-timings
+          path: build/native-ablation.csv
 
   memgraph-module-compile:
     runs-on: ubuntu-latest

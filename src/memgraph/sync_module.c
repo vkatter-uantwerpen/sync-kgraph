@@ -1,9 +1,14 @@
 #include "sync_kgraph/sync.h"
 
 #include "dynamic.h"
+#include "snapshot.h"
+#include "snapshot_cache.h"
 
 #include "mg_procedure.h"
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -13,7 +18,11 @@
 #include <time.h>
 
 #define SG_MATERIALIZE_BATCH 512U
+#define SG_HYDRATE_BATCH 4096U
 #define SG_ERROR_MESSAGE_CAPACITY 192U
+#define SG_SNAPSHOT_INCARNATION_CAPACITY 33U
+#define SG_SNAPSHOT_TOKEN_CAPACITY 64U
+#define SG_SNAPSHOT_CACHE_DEFAULT_BYTES ((size_t)512U * (size_t)1024U * (size_t)1024U)
 #define SG_VALIDATE_REPORTED_ARGUMENT 5U
 #define SG_VALIDATE_AVAILABLE_ARGUMENT 6U
 
@@ -28,6 +37,8 @@ typedef struct {
   bool dirty;
   bool prepared;
   bool incremental;
+  bool pair_edges_materialized;
+  char snapshot_token[SG_SNAPSHOT_TOKEN_CAPACITY];
 } model_metadata;
 
 typedef enum {
@@ -41,26 +52,29 @@ typedef enum {
   ORACLE_SOURCE_RECOMPUTED,
 } oracle_source;
 
+typedef enum {
+  CACHE_STATE_HOT = 0,
+  CACHE_STATE_HYDRATED,
+  CACHE_STATE_BYPASSED,
+} cache_state;
+
 typedef struct {
   oracle_source source;
   size_t oracle_builds;
   size_t oracle_rows_loaded;
   size_t oracle_load_batches;
   size_t oracle_cache_hits;
+  size_t snapshot_record_reads;
   uint64_t oracle_time_us;
+  uint64_t snapshot_hydration_time_us;
   uint64_t total_compute_time_us;
+  cache_state cache;
 } planning_metrics;
 
 typedef struct {
-  struct mgp_graph *graph;
-  struct mgp_memory *memory;
-  const char *model;
-  uint64_t oracle_epoch;
-  sg_pair_record *records;
-  size_t count;
-  size_t capacity;
+  const sg_pair_snapshot *snapshot;
   planning_metrics *metrics;
-} lazy_record_context;
+} snapshot_record_context;
 
 typedef struct {
   struct mgp_graph *graph;
@@ -95,6 +109,10 @@ typedef struct {
   struct mgp_memory *memory;
 } explain_context;
 
+static sg_snapshot_cache *snapshot_cache = NULL;
+static char snapshot_incarnation[SG_SNAPSHOT_INCARNATION_CAPACITY] = {0};
+static atomic_uint_fast64_t snapshot_counter = UINT64_C(1);
+
 static bool mg_ok(enum mgp_error error) {
   return error == MGP_ERROR_NO_ERROR;
 }
@@ -125,6 +143,69 @@ static const char *oracle_source_name(oracle_source source) {
     return "RECOMPUTED";
   }
   return "UNKNOWN";
+}
+
+static const char *cache_state_name(cache_state state) {
+  switch (state) {
+  case CACHE_STATE_HOT:
+    return "HOT";
+  case CACHE_STATE_HYDRATED:
+    return "HYDRATED";
+  case CACHE_STATE_BYPASSED:
+    return "BYPASSED";
+  }
+  return "UNKNOWN";
+}
+
+static bool initialize_snapshot_incarnation(void) {
+  unsigned char bytes[16] = {0};
+  FILE *random = fopen("/dev/urandom", "rb");
+  if (random == NULL) {
+    return false;
+  }
+  const bool read = fread(bytes, sizeof(bytes), 1U, random) == 1U;
+  const bool closed = fclose(random) == 0;
+  if (!read || !closed) {
+    return false;
+  }
+  for (size_t index = 0U; index < sizeof(bytes); ++index) {
+    const int written = snprintf(&snapshot_incarnation[index * 2U], 3U, "%02x", bytes[index]);
+    if (written != 2) {
+      return false;
+    }
+  }
+  snapshot_incarnation[sizeof(snapshot_incarnation) - 1U] = '\0';
+  return true;
+}
+
+static bool make_snapshot_token(char token[SG_SNAPSHOT_TOKEN_CAPACITY]) {
+  const uint_fast64_t counter =
+      atomic_fetch_add_explicit(&snapshot_counter, UINT64_C(1), memory_order_relaxed);
+  if (counter == UINT_FAST64_MAX) {
+    return false;
+  }
+  const int written = snprintf(token, SG_SNAPSHOT_TOKEN_CAPACITY, "%s-%016" PRIxFAST64,
+                               snapshot_incarnation, counter);
+  return written > 0 && (size_t)written < SG_SNAPSHOT_TOKEN_CAPACITY;
+}
+
+static bool snapshot_cache_limit(size_t *limit) {
+  const char *configured = getenv("SYNC_KGRAPH_CACHE_MAX_BYTES");
+  if (configured == NULL || configured[0] == '\0') {
+    *limit = SG_SNAPSHOT_CACHE_DEFAULT_BYTES;
+    return true;
+  }
+  if (configured[0] == '-') {
+    return false;
+  }
+  errno = 0;
+  char *end = NULL;
+  const unsigned long long parsed = strtoull(configured, &end, 10);
+  if (errno != 0 || end == configured || *end != '\0' || parsed > (unsigned long long)SIZE_MAX) {
+    return false;
+  }
+  *limit = (size_t)parsed;
+  return true;
 }
 
 #ifdef SYNC_KGRAPH_MGP_COMPAT
@@ -437,60 +518,6 @@ static bool row_pair_record(struct mgp_map *row, sg_pair_record *record) {
   return true;
 }
 
-static struct mgp_value *make_int_list(const size_t *values, size_t count,
-                                       struct mgp_memory *memory) {
-  struct mgp_list *list = NULL;
-  if (!mg_ok(mgp_list_make_empty(count, memory, &list)) || list == NULL) {
-    return NULL;
-  }
-  for (size_t index = 0U; index < count; ++index) {
-    int64_t converted = 0;
-    struct mgp_value *item = NULL;
-    if (!size_to_int64(values[index], &converted) ||
-        !mg_ok(mgp_value_make_int(converted, memory, &item)) || item == NULL ||
-        !mg_ok(mgp_list_append_move(list, item))) {
-      if (item != NULL) {
-        mgp_value_destroy(item);
-      }
-      mgp_list_destroy(list);
-      return NULL;
-    }
-  }
-  struct mgp_value *value = NULL;
-  if (!mg_ok(mgp_value_make_list(list, &value)) || value == NULL) {
-    mgp_list_destroy(list);
-    return NULL;
-  }
-  return value;
-}
-
-static struct mgp_map *make_pair_params(const char *model, uint64_t oracle_epoch,
-                                        const size_t *pair_ids, size_t pair_count,
-                                        struct mgp_memory *memory) {
-  struct mgp_map *params = make_model_params(model, memory);
-  int64_t epoch = 0;
-  struct mgp_value *pairs = make_int_list(pair_ids, pair_count, memory);
-  if (params == NULL || pairs == NULL || !uint64_to_int64(oracle_epoch, &epoch)) {
-    if (pairs != NULL) {
-      mgp_value_destroy(pairs);
-    }
-    if (params != NULL) {
-      mgp_map_destroy(params);
-    }
-    return NULL;
-  }
-  if (!params_insert_int(params, "oracle_epoch", epoch, memory)) {
-    mgp_value_destroy(pairs);
-    mgp_map_destroy(params);
-    return NULL;
-  }
-  if (!params_insert_value(params, "pair_ids", pairs)) {
-    mgp_map_destroy(params);
-    return NULL;
-  }
-  return params;
-}
-
 static sg_status load_metadata(struct mgp_graph *graph, struct mgp_memory *memory,
                                const char *model, model_metadata *metadata) {
   static const char *query = "MATCH (m:SyncModel {model: $model}) "
@@ -498,7 +525,10 @@ static sg_status load_metadata(struct mgp_graph *graph, struct mgp_memory *memor
                              "coalesce(m.oracle_epoch, 0) AS oracle_epoch, "
                              "coalesce(m.dirty, true) AS dirty, "
                              "coalesce(m.prepared_generation, -1) AS prepared_generation, "
-                             "coalesce(m.incremental, false) AS incremental";
+                             "coalesce(m.incremental, false) AS incremental, "
+                             "coalesce(m.pair_edges_materialized, false) "
+                             "AS pair_edges_materialized, "
+                             "coalesce(m.snapshot_token, \"\") AS snapshot_token";
   struct mgp_map *params = make_model_params(model, memory);
   if (params == NULL) {
     return SG_ERR_ALLOC;
@@ -514,6 +544,8 @@ static sg_status load_metadata(struct mgp_graph *graph, struct mgp_memory *memor
   int64_t prepared_generation = -1;
   bool dirty = true;
   bool incremental = false;
+  bool pair_edges_materialized = false;
+  const char *snapshot_token = NULL;
   if (status == SG_OK &&
       (!mg_ok(mgp_pull_one(execution, graph, memory, &row)) || row == NULL ||
        !row_int(row, "generation", &generation) || !row_int(row, "oracle_epoch", &oracle_epoch) ||
@@ -525,6 +557,11 @@ static sg_status load_metadata(struct mgp_graph *graph, struct mgp_memory *memor
   if (status == SG_OK && !row_bool(row, "incremental", &incremental)) {
     status = SG_ERR_INVALID_MODEL;
   }
+  if (status == SG_OK && (!row_bool(row, "pair_edges_materialized", &pair_edges_materialized) ||
+                          !row_string(row, "snapshot_token", &snapshot_token) ||
+                          strlen(snapshot_token) >= SG_SNAPSHOT_TOKEN_CAPACITY)) {
+    status = SG_ERR_INVALID_MODEL;
+  }
   struct mgp_map *extra = NULL;
   if (status == SG_OK &&
       (!mg_ok(mgp_pull_one(execution, graph, memory, &extra)) || extra != NULL)) {
@@ -534,8 +571,11 @@ static sg_status load_metadata(struct mgp_graph *graph, struct mgp_memory *memor
     metadata->generation = (uint64_t)generation;
     metadata->oracle_epoch = (uint64_t)oracle_epoch;
     metadata->dirty = dirty;
-    metadata->prepared = !dirty && oracle_epoch > 0 && prepared_generation == generation;
+    metadata->prepared = !dirty && oracle_epoch > 0 && prepared_generation == generation &&
+                         snapshot_token[0] != '\0';
     metadata->incremental = incremental;
+    metadata->pair_edges_materialized = pair_edges_materialized;
+    (void)memcpy(metadata->snapshot_token, snapshot_token, strlen(snapshot_token) + 1U);
   }
   if (execution != NULL) {
     mgp_execution_result_destroy(execution);
@@ -788,250 +828,6 @@ static size_t pair_index_for_states(size_t state_count, size_t first, size_t sec
   return (first * state_count) - ((first * (first + 1U)) / 2U) + second;
 }
 
-static size_t lazy_record_find(const lazy_record_context *context, size_t pair) {
-  for (size_t index = 0U; index < context->count; ++index) {
-    if (context->records[index].pair == pair) {
-      return index;
-    }
-  }
-  return SG_INDEX_NONE;
-}
-
-static bool lazy_record_reserve(lazy_record_context *context, size_t capacity) {
-  if (capacity <= context->capacity) {
-    return true;
-  }
-  if (capacity > SIZE_MAX / sizeof(*context->records)) {
-    return false;
-  }
-  sg_pair_record *records = realloc(context->records, capacity * sizeof(*records));
-  if (records == NULL) {
-    return false;
-  }
-  context->records = records;
-  context->capacity = capacity;
-  return true;
-}
-
-static sg_status lazy_record_load(lazy_record_context *context, const size_t *pair_ids,
-                                  size_t pair_count) {
-  static const char *query =
-      "UNWIND $pair_ids AS requested_pair "
-      "MATCH (p:SyncPair {model: $model, oracle_epoch: $oracle_epoch, "
-      "pair_id: requested_pair}) "
-      "RETURN p.pair_id AS pair_id, p.mergeable AS mergeable, "
-      "p.merge_distance AS merge_distance, p.merge_action_id AS merge_action_id, "
-      "p.merge_next_pair AS merge_next_pair, p.merge_support_count AS merge_support_count, "
-      "p.resolvable AS resolvable, p.resolution_distance AS resolution_distance, "
-      "p.resolution_action_id AS resolution_action_id, "
-      "p.resolution_next_pair AS resolution_next_pair, "
-      "p.resolution_support_count AS resolution_support_count";
-  if (pair_count == 0U) {
-    return SG_OK;
-  }
-  struct mgp_map *params = make_pair_params(context->model, context->oracle_epoch, pair_ids,
-                                            pair_count, context->memory);
-  if (params == NULL) {
-    return SG_ERR_ALLOC;
-  }
-  const uint64_t start = monotonic_time_us();
-  struct mgp_execution_result *execution = NULL;
-  sg_status status = SG_OK;
-  if (!mg_ok(mgp_execute_query(context->graph, context->memory, query, params, &execution)) ||
-      execution == NULL) {
-    status = SG_ERR_INVALID_MODEL;
-  }
-  size_t loaded = 0U;
-  while (status == SG_OK) {
-    struct mgp_map *row = NULL;
-    if (!mg_ok(mgp_pull_one(execution, context->graph, context->memory, &row))) {
-      status = SG_ERR_INVALID_MODEL;
-      break;
-    }
-    if (row == NULL) {
-      break;
-    }
-    sg_pair_record record = {0};
-    if (!row_pair_record(row, &record) || lazy_record_find(context, record.pair) != SG_INDEX_NONE) {
-      status = SG_ERR_INVALID_MODEL;
-      break;
-    }
-    if (!lazy_record_reserve(context, context->count + 1U)) {
-      status = SG_ERR_ALLOC;
-      break;
-    }
-    context->records[context->count] = record;
-    ++context->count;
-    ++loaded;
-  }
-  if (execution != NULL) {
-    mgp_execution_result_destroy(execution);
-  }
-  mgp_map_destroy(params);
-  ++context->metrics->oracle_load_batches;
-  context->metrics->oracle_rows_loaded += loaded;
-  context->metrics->oracle_time_us += elapsed_us(start);
-  return status == SG_OK && loaded == pair_count ? SG_OK : SG_ERR_INVALID_MODEL;
-}
-
-static sg_status lazy_record_read(void *raw_context, const size_t *pair_ids, size_t pair_count,
-                                  sg_pair_record *records) {
-  lazy_record_context *context = raw_context;
-  size_t *missing = calloc(pair_count == 0U ? 1U : pair_count, sizeof(*missing));
-  if (context == NULL || pair_ids == NULL || records == NULL || missing == NULL) {
-    free(missing);
-    return SG_ERR_INVALID_ARGUMENT;
-  }
-  size_t missing_count = 0U;
-  for (size_t index = 0U; index < pair_count; ++index) {
-    if (lazy_record_find(context, pair_ids[index]) != SG_INDEX_NONE) {
-      ++context->metrics->oracle_cache_hits;
-      continue;
-    }
-    bool already_missing = false;
-    for (size_t prior = 0U; prior < missing_count; ++prior) {
-      if (missing[prior] == pair_ids[index]) {
-        already_missing = true;
-        break;
-      }
-    }
-    if (!already_missing) {
-      missing[missing_count] = pair_ids[index];
-      ++missing_count;
-    }
-  }
-  sg_status status = lazy_record_load(context, missing, missing_count);
-  for (size_t index = 0U; status == SG_OK && index < pair_count; ++index) {
-    const size_t position = lazy_record_find(context, pair_ids[index]);
-    if (position == SG_INDEX_NONE) {
-      status = SG_ERR_INVALID_MODEL;
-    } else {
-      records[index] = context->records[position];
-    }
-  }
-  free(missing);
-  return status;
-}
-
-static void lazy_record_context_free(lazy_record_context *context) {
-  free(context->records);
-  context->records = NULL;
-  context->count = 0U;
-  context->capacity = 0U;
-}
-
-static sg_status memgraph_store_read_records(void *raw_context, const size_t *pair_ids,
-                                             size_t pair_count, sg_pair_record *records) {
-  memgraph_pair_store *store = raw_context;
-  planning_metrics metrics = {0};
-  lazy_record_context context = {
-      .graph = store->graph,
-      .memory = store->memory,
-      .model = store->model,
-      .oracle_epoch = store->oracle_epoch,
-      .metrics = &metrics,
-  };
-  const sg_status status = lazy_record_read(&context, pair_ids, pair_count, records);
-  lazy_record_context_free(&context);
-  return status;
-}
-
-static sg_status memgraph_store_read_arcs(memgraph_pair_store *store, const size_t *pair_ids,
-                                          size_t pair_count, bool incoming,
-                                          sg_pair_arc_batch *batch) {
-  static const char *outgoing_query =
-      "UNWIND $pair_ids AS requested_pair "
-      "MATCH (p:SyncPair {model: $model, oracle_epoch: $oracle_epoch, "
-      "pair_id: requested_pair})-[r:PAIR_NEXT {model: $model, "
-      "oracle_epoch: $oracle_epoch}]->(n:SyncPair {model: $model, "
-      "oracle_epoch: $oracle_epoch}) "
-      "RETURN p.pair_id AS source_pair, r.action_id AS action_id, "
-      "n.pair_id AS target_pair, r.outputs_differ AS outputs_differ";
-  static const char *incoming_query =
-      "UNWIND $pair_ids AS requested_pair "
-      "MATCH (p:SyncPair {model: $model, oracle_epoch: $oracle_epoch})-"
-      "[r:PAIR_NEXT {model: $model, oracle_epoch: $oracle_epoch}]->"
-      "(n:SyncPair {model: $model, oracle_epoch: $oracle_epoch, "
-      "pair_id: requested_pair}) "
-      "RETURN p.pair_id AS source_pair, r.action_id AS action_id, "
-      "n.pair_id AS target_pair, r.outputs_differ AS outputs_differ";
-  *batch = (sg_pair_arc_batch){0};
-  struct mgp_map *params =
-      make_pair_params(store->model, store->oracle_epoch, pair_ids, pair_count, store->memory);
-  if (params == NULL) {
-    return SG_ERR_ALLOC;
-  }
-  struct mgp_execution_result *execution = NULL;
-  sg_status status = SG_OK;
-  if (!mg_ok(mgp_execute_query(store->graph, store->memory,
-                               incoming ? incoming_query : outgoing_query, params, &execution)) ||
-      execution == NULL) {
-    status = SG_ERR_INVALID_MODEL;
-  }
-  size_t capacity = 0U;
-  while (status == SG_OK) {
-    struct mgp_map *row = NULL;
-    if (!mg_ok(mgp_pull_one(execution, store->graph, store->memory, &row))) {
-      status = SG_ERR_INVALID_MODEL;
-      break;
-    }
-    if (row == NULL) {
-      break;
-    }
-    if (batch->count == capacity) {
-      const size_t next_capacity = capacity == 0U ? 32U : capacity * 2U;
-      if (next_capacity < capacity || next_capacity > SIZE_MAX / sizeof(*batch->items)) {
-        status = SG_ERR_ALLOC;
-        break;
-      }
-      sg_pair_arc *items = realloc(batch->items, next_capacity * sizeof(*items));
-      if (items == NULL) {
-        status = SG_ERR_ALLOC;
-        break;
-      }
-      batch->items = items;
-      capacity = next_capacity;
-    }
-    int64_t source = -1;
-    int64_t action = -1;
-    int64_t target = -1;
-    bool outputs_differ = false;
-    if (!row_int(row, "source_pair", &source) || !row_int(row, "action_id", &action) ||
-        !row_int(row, "target_pair", &target) ||
-        !row_bool(row, "outputs_differ", &outputs_differ) || source < 0 || action < 0 ||
-        target < 0) {
-      status = SG_ERR_INVALID_MODEL;
-      break;
-    }
-    batch->items[batch->count] = (sg_pair_arc){
-        .source_pair = (size_t)source,
-        .action = (size_t)action,
-        .target_pair = (size_t)target,
-        .outputs_differ = outputs_differ,
-    };
-    ++batch->count;
-  }
-  if (execution != NULL) {
-    mgp_execution_result_destroy(execution);
-  }
-  mgp_map_destroy(params);
-  if (status != SG_OK) {
-    free(batch->items);
-    *batch = (sg_pair_arc_batch){0};
-  }
-  return status;
-}
-
-static sg_status memgraph_store_read_outgoing(void *raw_context, const size_t *source_pairs,
-                                              size_t source_count, sg_pair_arc_batch *batch) {
-  return memgraph_store_read_arcs(raw_context, source_pairs, source_count, false, batch);
-}
-
-static sg_status memgraph_store_read_incoming(void *raw_context, const size_t *target_pairs,
-                                              size_t target_count, sg_pair_arc_batch *batch) {
-  return memgraph_store_read_arcs(raw_context, target_pairs, target_count, true, batch);
-}
-
 static bool append_store_record(struct mgp_list *list, const memgraph_pair_store *store,
                                 const sg_pair_record *record) {
   const char *merge_action = record->merge_action == SG_INDEX_NONE
@@ -1140,20 +936,6 @@ static sg_status memgraph_store_write_record_batch(memgraph_pair_store *store,
   const bool ok = execute_drain(store->graph, store->memory, query, params);
   mgp_map_destroy(params);
   return ok ? SG_OK : SG_ERR_INVALID_MODEL;
-}
-
-static sg_status memgraph_store_write_records(void *raw_context, const sg_pair_record *records,
-                                              size_t record_count) {
-  memgraph_pair_store *store = raw_context;
-  for (size_t first = 0U; first < record_count; first += SG_MATERIALIZE_BATCH) {
-    const size_t remaining = record_count - first;
-    const size_t count = remaining < SG_MATERIALIZE_BATCH ? remaining : SG_MATERIALIZE_BATCH;
-    const sg_status status = memgraph_store_write_record_batch(store, &records[first], count);
-    if (status != SG_OK) {
-      return status;
-    }
-  }
-  return SG_OK;
 }
 
 static bool list_to_ids(const sg_automaton *automaton, struct mgp_value *value, bool actions,
@@ -1395,6 +1177,27 @@ static bool apply_base_changes(struct mgp_graph *graph, struct mgp_memory *memor
   return ok;
 }
 
+static int compare_edge_updates(const void *left, const void *right) {
+  const pair_edge_update *first = left;
+  const pair_edge_update *second = right;
+  if (first->pair != second->pair) {
+    return first->pair < second->pair ? -1 : 1;
+  }
+  if (first->action != second->action) {
+    return first->action < second->action ? -1 : 1;
+  }
+  return 0;
+}
+
+static int compare_size_values(const void *left, const void *right) {
+  const size_t first = *(const size_t *)left;
+  const size_t second = *(const size_t *)right;
+  if (first == second) {
+    return 0;
+  }
+  return first < second ? -1 : 1;
+}
+
 static sg_status build_edge_updates(const sg_automaton *automaton, const cell_change *changes,
                                     size_t change_count, pair_edge_update **updates,
                                     size_t *update_count, size_t **seed_pairs, size_t *seed_count) {
@@ -1402,66 +1205,55 @@ static sg_status build_edge_updates(const sg_automaton *automaton, const cell_ch
   *update_count = 0U;
   *seed_pairs = NULL;
   *seed_count = 0U;
-  size_t pair_count = 0U;
-  if (!pair_count_for_states(sg_automaton_state_count(automaton), &pair_count)) {
-    return SG_ERR_ALLOC;
-  }
-  size_t edge_count = 0U;
-  const size_t actions = sg_automaton_action_count(automaton);
-  if (pair_count == 0U || actions == 0U) {
+  const size_t state_count = sg_automaton_state_count(automaton);
+  const size_t action_count = sg_automaton_action_count(automaton);
+  if (state_count == 0U || action_count == 0U) {
     return SG_ERR_INVALID_MODEL;
   }
-  if (actions > SIZE_MAX / pair_count) {
+  if (change_count > SIZE_MAX / state_count) {
     return SG_ERR_ALLOC;
   }
-  edge_count = pair_count * actions;
-  bool *edge_seen = calloc(edge_count, sizeof(*edge_seen));
-  bool *seed_seen = calloc(pair_count, sizeof(*seed_seen));
-  pair_edge_update *created_updates = calloc(edge_count, sizeof(*created_updates));
-  size_t *created_seeds = calloc(pair_count, sizeof(*created_seeds));
-  if (edge_seen == NULL || seed_seen == NULL || created_updates == NULL || created_seeds == NULL) {
-    free(edge_seen);
-    free(seed_seen);
+  const size_t maximum_updates = change_count * state_count;
+  pair_edge_update *created_updates = calloc(maximum_updates, sizeof(*created_updates));
+  size_t *created_seeds = calloc(maximum_updates, sizeof(*created_seeds));
+  if (created_updates == NULL || created_seeds == NULL) {
     free(created_updates);
     free(created_seeds);
     return SG_ERR_ALLOC;
   }
-  const size_t state_count = sg_automaton_state_count(automaton);
-  const size_t action_count = sg_automaton_action_count(automaton);
+  size_t created_count = 0U;
   for (size_t change = 0U; change < change_count; ++change) {
     for (size_t other = 0U; other < state_count; ++other) {
       const size_t pair = pair_index_for_states(state_count, changes[change].state, other);
-      edge_seen[(pair * action_count) + changes[change].action] = true;
-      if (!seed_seen[pair]) {
-        seed_seen[pair] = true;
-        created_seeds[*seed_count] = pair;
-        ++*seed_count;
-      }
+      const size_t first = changes[change].state < other ? changes[change].state : other;
+      const size_t second = changes[change].state < other ? other : changes[change].state;
+      const size_t action = changes[change].action;
+      const size_t first_next = sg_automaton_transition(automaton, first, action);
+      const size_t second_next = sg_automaton_transition(automaton, second, action);
+      created_updates[created_count] = (pair_edge_update){
+          .pair = pair,
+          .action = action,
+          .next_pair = pair_index_for_states(state_count, first_next, second_next),
+          .outputs_differ = sg_automaton_observation(automaton, first, action) !=
+                            sg_automaton_observation(automaton, second, action),
+      };
+      created_seeds[created_count] = pair;
+      ++created_count;
     }
   }
-  size_t pair = 0U;
-  for (size_t first = 0U; first < state_count; ++first) {
-    for (size_t second = first; second < state_count; ++second) {
-      for (size_t action = 0U; action < action_count; ++action) {
-        if (!edge_seen[(pair * action_count) + action]) {
-          continue;
-        }
-        const size_t first_next = sg_automaton_transition(automaton, first, action);
-        const size_t second_next = sg_automaton_transition(automaton, second, action);
-        created_updates[*update_count] = (pair_edge_update){
-            .pair = pair,
-            .action = action,
-            .next_pair = pair_index_for_states(state_count, first_next, second_next),
-            .outputs_differ = sg_automaton_observation(automaton, first, action) !=
-                              sg_automaton_observation(automaton, second, action),
-        };
-        ++*update_count;
-      }
-      ++pair;
+  qsort(created_updates, created_count, sizeof(*created_updates), compare_edge_updates);
+  qsort(created_seeds, created_count, sizeof(*created_seeds), compare_size_values);
+  for (size_t index = 0U; index < created_count; ++index) {
+    if (*update_count == 0U ||
+        compare_edge_updates(&created_updates[*update_count - 1U], &created_updates[index]) != 0) {
+      created_updates[*update_count] = created_updates[index];
+      ++*update_count;
+    }
+    if (*seed_count == 0U || created_seeds[*seed_count - 1U] != created_seeds[index]) {
+      created_seeds[*seed_count] = created_seeds[index];
+      ++*seed_count;
     }
   }
-  free(edge_seen);
-  free(seed_seen);
   *updates = created_updates;
   *seed_pairs = created_seeds;
   return SG_OK;
@@ -1511,15 +1303,20 @@ static sg_status replace_edge_batch(memgraph_pair_store *store, const pair_edge_
   static const char *query =
       "UNWIND $edges AS e "
       "MATCH (p:SyncPair {model: $model, oracle_epoch: $oracle_epoch, pair_id: e.pair_id}) "
-      "OPTIONAL MATCH (p)-[old:PAIR_NEXT {model: $model, oracle_epoch: $oracle_epoch, "
+      "OPTIONAL MATCH (p)-[old_next:PAIR_NEXT {model: $model, oracle_epoch: $oracle_epoch, "
       "action_id: e.action_id}]->() "
-      "DELETE old "
+      "OPTIONAL MATCH ()-[old_pre:PAIR_PRE {model: $model, oracle_epoch: $oracle_epoch, "
+      "action_id: e.action_id}]->(p) "
+      "DELETE old_next, old_pre "
       "WITH p, e "
       "MATCH (n:SyncPair {model: $model, oracle_epoch: $oracle_epoch, "
       "pair_id: e.next_pair}) "
       "CREATE (p)-[:PAIR_NEXT {model: $model, oracle_epoch: $oracle_epoch, "
       "updated_generation: e.updated_generation, action: e.action, "
-      "action_id: e.action_id, outputs_differ: e.outputs_differ}]->(n)";
+      "action_id: e.action_id, outputs_differ: e.outputs_differ}]->(n) "
+      "CREATE (n)-[:PAIR_PRE {model: $model, oracle_epoch: $oracle_epoch, "
+      "updated_generation: e.updated_generation, action: e.action, "
+      "action_id: e.action_id, outputs_differ: e.outputs_differ}]->(p)";
   struct mgp_list *list = NULL;
   if (!mg_ok(mgp_list_make_empty(update_count, store->memory, &list)) || list == NULL) {
     return SG_ERR_ALLOC;
@@ -1876,13 +1673,15 @@ static bool execute_edge_batch(struct mgp_graph *graph, struct mgp_memory *memor
 static bool materialize_oracle(struct mgp_graph *graph, struct mgp_memory *memory,
                                const char *model, const sg_automaton *automaton,
                                const sg_pair_oracle *oracle, uint64_t oracle_epoch,
-                               bool materialize_edges, bool incremental) {
+                               bool materialize_edges, bool incremental,
+                               const char *snapshot_token) {
   static const char *clear_query = "MATCH (p:SyncPair {model: $model}) DETACH DELETE p";
   static const char *finish_query = "MATCH (m:SyncModel {model: $model}) "
                                     "SET m.dirty = false, m.prepared_generation = $generation, "
                                     "m.oracle_epoch = $oracle_epoch, "
                                     "m.incremental = $incremental, "
-                                    "m.pair_edges_materialized = $pair_edges_materialized";
+                                    "m.pair_edges_materialized = $pair_edges_materialized, "
+                                    "m.snapshot_token = $snapshot_token";
   if (!execute_model_query(graph, memory, model, clear_query)) {
     return false;
   }
@@ -1894,7 +1693,7 @@ static bool materialize_oracle(struct mgp_graph *graph, struct mgp_memory *memor
       return false;
     }
   }
-  if (materialize_edges || incremental) {
+  if (materialize_edges) {
     const size_t edge_count = sg_pair_oracle_pair_edge_count(oracle);
     for (size_t first = 0U; first < edge_count; first += SG_MATERIALIZE_BATCH) {
       const size_t remaining = edge_count - first;
@@ -1913,8 +1712,8 @@ static bool materialize_oracle(struct mgp_graph *graph, struct mgp_memory *memor
       !params_insert_int(params, "generation", generation, memory) ||
       !params_insert_int(params, "oracle_epoch", epoch, memory) ||
       !params_insert_bool(params, "incremental", incremental, memory) ||
-      !params_insert_bool(params, "pair_edges_materialized", materialize_edges || incremental,
-                          memory)) {
+      !params_insert_bool(params, "pair_edges_materialized", materialize_edges, memory) ||
+      !params_insert_string(params, "snapshot_token", snapshot_token, memory)) {
     if (params != NULL) {
       mgp_map_destroy(params);
     }
@@ -1942,6 +1741,150 @@ static bool load_prepared_automaton(struct mgp_graph *graph, struct mgp_memory *
   return true;
 }
 
+static sg_status load_snapshot_record_batch(struct mgp_graph *graph, struct mgp_memory *memory,
+                                            const char *model, uint64_t oracle_epoch,
+                                            size_t first_pair, size_t pair_count,
+                                            sg_pair_record *records) {
+  static const char *query =
+      "MATCH (p:SyncPair {model: $model, oracle_epoch: $oracle_epoch}) "
+      "WHERE p.pair_id >= $first_pair AND p.pair_id < $last_pair "
+      "RETURN p.pair_id AS pair_id, p.mergeable AS mergeable, "
+      "p.merge_distance AS merge_distance, p.merge_action_id AS merge_action_id, "
+      "p.merge_next_pair AS merge_next_pair, p.merge_support_count AS merge_support_count, "
+      "p.resolvable AS resolvable, p.resolution_distance AS resolution_distance, "
+      "p.resolution_action_id AS resolution_action_id, "
+      "p.resolution_next_pair AS resolution_next_pair, "
+      "p.resolution_support_count AS resolution_support_count "
+      "ORDER BY p.pair_id";
+  struct mgp_map *params = make_model_params(model, memory);
+  int64_t epoch = 0;
+  int64_t first = 0;
+  int64_t last = 0;
+  if (params == NULL || !uint64_to_int64(oracle_epoch, &epoch) ||
+      !size_to_int64(first_pair, &first) || !size_to_int64(first_pair + pair_count, &last) ||
+      !params_insert_int(params, "oracle_epoch", epoch, memory) ||
+      !params_insert_int(params, "first_pair", first, memory) ||
+      !params_insert_int(params, "last_pair", last, memory)) {
+    if (params != NULL) {
+      mgp_map_destroy(params);
+    }
+    return SG_ERR_ALLOC;
+  }
+  struct mgp_execution_result *execution = NULL;
+  sg_status status = SG_OK;
+  if (!mg_ok(mgp_execute_query(graph, memory, query, params, &execution)) || execution == NULL) {
+    status = SG_ERR_INVALID_MODEL;
+  }
+  size_t loaded = 0U;
+  while (status == SG_OK) {
+    struct mgp_map *row = NULL;
+    if (!mg_ok(mgp_pull_one(execution, graph, memory, &row))) {
+      status = SG_ERR_INVALID_MODEL;
+      break;
+    }
+    if (row == NULL) {
+      break;
+    }
+    if (loaded >= pair_count || !row_pair_record(row, &records[loaded]) ||
+        records[loaded].pair != first_pair + loaded) {
+      status = SG_ERR_INVALID_MODEL;
+      break;
+    }
+    ++loaded;
+  }
+  if (execution != NULL) {
+    mgp_execution_result_destroy(execution);
+  }
+  mgp_map_destroy(params);
+  return status == SG_OK && loaded == pair_count ? SG_OK : SG_ERR_INVALID_MODEL;
+}
+
+static sg_status hydrate_snapshot(struct mgp_graph *graph, struct mgp_memory *memory,
+                                  const char *model, const model_metadata *metadata,
+                                  planning_metrics *metrics, sg_pair_snapshot **snapshot) {
+  const uint64_t start = monotonic_time_us();
+  sg_automaton *automaton = NULL;
+  sg_status status =
+      load_automaton_generation(graph, memory, model, metadata->generation, &automaton);
+  size_t pair_count = 0U;
+  if (status == SG_OK && !pair_count_for_states(sg_automaton_state_count(automaton), &pair_count)) {
+    status = SG_ERR_ALLOC;
+  }
+  sg_pair_record *records = NULL;
+  if (status == SG_OK) {
+    records = calloc(pair_count == 0U ? 1U : pair_count, sizeof(*records));
+    if (records == NULL) {
+      status = SG_ERR_ALLOC;
+    }
+  }
+  for (size_t first = 0U; status == SG_OK && first < pair_count; first += SG_HYDRATE_BATCH) {
+    const size_t remaining = pair_count - first;
+    const size_t count = remaining < SG_HYDRATE_BATCH ? remaining : SG_HYDRATE_BATCH;
+    status = load_snapshot_record_batch(graph, memory, model, metadata->oracle_epoch, first, count,
+                                        &records[first]);
+    ++metrics->oracle_load_batches;
+    if (status == SG_OK) {
+      metrics->oracle_rows_loaded += count;
+    }
+  }
+  if (status == SG_OK) {
+    status = sg_pair_snapshot_restore(automaton, records, pair_count, snapshot);
+  }
+  free(records);
+  sg_automaton_free(automaton);
+  metrics->snapshot_hydration_time_us = elapsed_us(start);
+  metrics->oracle_time_us += metrics->snapshot_hydration_time_us;
+  return status;
+}
+
+static bool load_prepared_snapshot(struct mgp_graph *graph, struct mgp_memory *memory,
+                                   const char *model, model_metadata *metadata,
+                                   planning_metrics *metrics, sg_pair_snapshot **snapshot,
+                                   struct mgp_result *result) {
+  sg_status status = load_metadata(graph, memory, model, metadata);
+  if (status != SG_OK) {
+    set_status_error(result, "model metadata lookup failed", status);
+    return false;
+  }
+  if (!metadata->prepared) {
+    set_error(result, "model is dirty or has not been prepared for this module version");
+    return false;
+  }
+  *snapshot = sg_snapshot_cache_lookup(snapshot_cache, model, metadata->oracle_epoch,
+                                       metadata->generation, metadata->snapshot_token);
+  if (*snapshot != NULL) {
+    metrics->cache = CACHE_STATE_HOT;
+    return true;
+  }
+  metrics->cache = CACHE_STATE_HYDRATED;
+  status = hydrate_snapshot(graph, memory, model, metadata, metrics, snapshot);
+  bool stored = false;
+  if (status == SG_OK) {
+    status = sg_snapshot_cache_insert(snapshot_cache, model, metadata->oracle_epoch,
+                                      metadata->generation, metadata->snapshot_token, *snapshot,
+                                      &stored);
+  }
+  (void)stored;
+  if (status != SG_OK) {
+    set_status_error(result, "prepared snapshot hydration failed", status);
+    sg_pair_snapshot_release(*snapshot);
+    *snapshot = NULL;
+    return false;
+  }
+  return true;
+}
+
+static sg_status snapshot_record_read(void *raw_context, const size_t *pair_ids, size_t pair_count,
+                                      sg_pair_record *records) {
+  snapshot_record_context *context = raw_context;
+  const sg_status status = sg_pair_snapshot_read(context->snapshot, pair_ids, pair_count, records);
+  if (status == SG_OK) {
+    context->metrics->snapshot_record_reads += pair_count;
+    context->metrics->oracle_cache_hits += pair_count;
+  }
+  return status;
+}
+
 static void prepare_model_cb(struct mgp_list *arguments, struct mgp_graph *graph,
                              struct mgp_result *result, struct mgp_memory *memory) {
   const char *model = NULL;
@@ -1949,9 +1892,8 @@ static void prepare_model_cb(struct mgp_list *arguments, struct mgp_graph *graph
   bool incremental = false;
   if (!get_string_arg(arguments, 0U, &model) ||
       !get_bool_arg_default(arguments, 1U, false, &materialize_edges) ||
-      !get_bool_arg_default(arguments, 2U, false, &incremental) ||
-      (materialize_edges && incremental)) {
-    set_error(result, "expected model and compatible optional materialize/incremental booleans");
+      !get_bool_arg_default(arguments, 2U, false, &incremental)) {
+    set_error(result, "expected model and optional materialize/incremental booleans");
     return;
   }
   model_metadata metadata = {0};
@@ -1963,6 +1905,10 @@ static void prepare_model_cb(struct mgp_list *arguments, struct mgp_graph *graph
   }
   sg_pair_oracle *oracle = NULL;
   status = sg_pair_oracle_build(automaton, &oracle);
+  sg_pair_snapshot *prepared_snapshot = NULL;
+  if (status == SG_OK) {
+    status = sg_pair_snapshot_from_oracle(automaton, oracle, &prepared_snapshot);
+  }
   const uint64_t oracle_epoch = metadata.oracle_epoch + 1U;
   const size_t pair_count = status == SG_OK ? sg_pair_oracle_pair_count(oracle) : 0U;
   const size_t edge_count = status == SG_OK ? sg_pair_oracle_pair_edge_count(oracle) : 0U;
@@ -1971,12 +1917,23 @@ static void prepare_model_cb(struct mgp_list *arguments, struct mgp_graph *graph
                           !size_to_int64(sg_automaton_action_count(automaton), &ignored))) {
     status = SG_ERR_RESOURCE_BOUND;
   }
+  char snapshot_token[SG_SNAPSHOT_TOKEN_CAPACITY] = {0};
+  if (status == SG_OK && !make_snapshot_token(snapshot_token)) {
+    status = SG_ERR_RESOURCE_BOUND;
+  }
   if (status == SG_OK && !materialize_oracle(graph, memory, model, automaton, oracle, oracle_epoch,
-                                             materialize_edges, incremental)) {
+                                             materialize_edges, incremental, snapshot_token)) {
     status = SG_ERR_INVALID_MODEL;
+  }
+  bool snapshot_stored = false;
+  if (status == SG_OK) {
+    status = sg_snapshot_cache_insert(snapshot_cache, model, oracle_epoch,
+                                      sg_automaton_generation(automaton), snapshot_token,
+                                      prepared_snapshot, &snapshot_stored);
   }
   if (status != SG_OK) {
     set_status_error(result, "model preparation failed", status);
+    sg_pair_snapshot_release(prepared_snapshot);
     sg_pair_oracle_free(oracle);
     sg_automaton_free(automaton);
     return;
@@ -2011,10 +1968,12 @@ static void prepare_model_cb(struct mgp_list *arguments, struct mgp_graph *graph
                   memory) ||
       !insert_int(record, "resolvable_pairs", (int64_t)sg_pair_oracle_resolvable_pair_count(oracle),
                   memory) ||
-      !insert_bool(record, "materialized_pair_edges", materialize_edges || incremental, memory) ||
+      !insert_bool(record, "materialized_pair_edges", materialize_edges, memory) ||
       !insert_bool(record, "incremental_enabled", incremental, memory)) {
     set_error(result, "failed to create preparation result");
   }
+  (void)snapshot_stored;
+  sg_pair_snapshot_release(prepared_snapshot);
   sg_pair_oracle_free(oracle);
   sg_automaton_free(automaton);
 }
@@ -2030,7 +1989,9 @@ static bool insert_plan_common(struct mgp_result_record *record, const sg_automa
   int64_t oracle_rows_loaded = 0;
   int64_t oracle_load_batches = 0;
   int64_t oracle_cache_hits = 0;
+  int64_t snapshot_record_reads = 0;
   int64_t oracle_time = 0;
+  int64_t snapshot_hydration_time = 0;
   int64_t total_compute_time = 0;
   return uint64_to_int64(plan->generation, &generation) &&
          size_to_int64(plan->word.length, &length) &&
@@ -2040,7 +2001,9 @@ static bool insert_plan_common(struct mgp_result_record *record, const sg_automa
          size_to_int64(metrics->oracle_rows_loaded, &oracle_rows_loaded) &&
          size_to_int64(metrics->oracle_load_batches, &oracle_load_batches) &&
          size_to_int64(metrics->oracle_cache_hits, &oracle_cache_hits) &&
+         size_to_int64(metrics->snapshot_record_reads, &snapshot_record_reads) &&
          uint64_to_int64(metrics->oracle_time_us, &oracle_time) &&
+         uint64_to_int64(metrics->snapshot_hydration_time_us, &snapshot_hydration_time) &&
          uint64_to_int64(metrics->total_compute_time_us, &total_compute_time) &&
          insert_string(record, "status", "OK", memory) &&
          insert_string(record, "outcome", sg_plan_outcome_name(plan->outcome), memory) &&
@@ -2052,11 +2015,14 @@ static bool insert_plan_common(struct mgp_result_record *record, const sg_automa
          insert_int(record, "generation", generation, memory) &&
          insert_int(record, "planning_time_us", planning_time, memory) &&
          insert_string(record, "oracle_source", oracle_source_name(metrics->source), memory) &&
+         insert_string(record, "cache_state", cache_state_name(metrics->cache), memory) &&
          insert_int(record, "oracle_builds", oracle_builds, memory) &&
          insert_int(record, "oracle_rows_loaded", oracle_rows_loaded, memory) &&
          insert_int(record, "oracle_load_batches", oracle_load_batches, memory) &&
          insert_int(record, "oracle_cache_hits", oracle_cache_hits, memory) &&
+         insert_int(record, "snapshot_record_reads", snapshot_record_reads, memory) &&
          insert_int(record, "oracle_time_us", oracle_time, memory) &&
+         insert_int(record, "snapshot_hydration_time_us", snapshot_hydration_time, memory) &&
          insert_int(record, "total_compute_time_us", total_compute_time, memory);
 }
 
@@ -2071,42 +2037,44 @@ static void plan_sync_impl(struct mgp_list *arguments, struct mgp_graph *graph,
     return;
   }
   const uint64_t total_start = monotonic_time_us();
-  sg_automaton *automaton = NULL;
+  sg_automaton *owned_automaton = NULL;
+  const sg_automaton *automaton = NULL;
   sg_pair_oracle *oracle = NULL;
+  sg_pair_snapshot *snapshot = NULL;
   model_metadata metadata = {0};
-  planning_metrics metrics = {.source = source};
+  planning_metrics metrics = {.source = source, .cache = CACHE_STATE_BYPASSED};
   if (source == ORACLE_SOURCE_PERSISTED) {
-    if (!load_prepared_automaton(graph, memory, model, &metadata, &automaton, result)) {
+    if (!load_prepared_snapshot(graph, memory, model, &metadata, &metrics, &snapshot, result)) {
       return;
     }
+    automaton = sg_pair_snapshot_automaton(snapshot);
   } else {
-    const sg_status load_status = load_base_automaton(graph, memory, model, &automaton);
+    const sg_status load_status = load_base_automaton(graph, memory, model, &owned_automaton);
     if (load_status != SG_OK) {
       set_status_error(result, "model extraction failed", load_status);
       return;
     }
+    automaton = owned_automaton;
   }
   size_t *hypotheses = NULL;
   size_t hypothesis_count = 0U;
   if (!argument_to_ids(automaton, arguments, 1U, false, false, &hypotheses, &hypothesis_count)) {
     set_error(result, "hypotheses must be a nonempty list of known state keys");
     sg_pair_oracle_free(oracle);
-    sg_automaton_free(automaton);
+    sg_pair_snapshot_release(snapshot);
+    sg_automaton_free(owned_automaton);
     return;
   }
   sg_plan_result plan = {0};
-  lazy_record_context lazy = {
-      .graph = graph,
-      .memory = memory,
-      .model = model,
-      .oracle_epoch = metadata.oracle_epoch,
+  snapshot_record_context snapshot_records = {
+      .snapshot = snapshot,
       .metrics = &metrics,
   };
   sg_status status = SG_OK;
   if (source == ORACLE_SOURCE_PERSISTED) {
     const sg_pair_record_source record_source = {
-        .context = &lazy,
-        .read = lazy_record_read,
+        .context = &snapshot_records,
+        .read = snapshot_record_read,
     };
     status = sg_plan_sync_from_records(automaton, &record_source, hypotheses, hypothesis_count,
                                        (size_t)budget, &plan);
@@ -2138,9 +2106,9 @@ static void plan_sync_impl(struct mgp_list *arguments, struct mgp_graph *graph,
     }
   }
   sg_plan_result_free(&plan);
-  lazy_record_context_free(&lazy);
   sg_pair_oracle_free(oracle);
-  sg_automaton_free(automaton);
+  sg_pair_snapshot_release(snapshot);
+  sg_automaton_free(owned_automaton);
 }
 
 static void plan_sync_cb(struct mgp_list *arguments, struct mgp_graph *graph,
@@ -2166,42 +2134,44 @@ static void plan_disambiguate_impl(struct mgp_list *arguments, struct mgp_graph 
     return;
   }
   const uint64_t total_start = monotonic_time_us();
-  sg_automaton *automaton = NULL;
+  sg_automaton *owned_automaton = NULL;
+  const sg_automaton *automaton = NULL;
   sg_pair_oracle *oracle = NULL;
+  sg_pair_snapshot *snapshot = NULL;
   model_metadata metadata = {0};
-  planning_metrics metrics = {.source = source};
+  planning_metrics metrics = {.source = source, .cache = CACHE_STATE_BYPASSED};
   if (source == ORACLE_SOURCE_PERSISTED) {
-    if (!load_prepared_automaton(graph, memory, model, &metadata, &automaton, result)) {
+    if (!load_prepared_snapshot(graph, memory, model, &metadata, &metrics, &snapshot, result)) {
       return;
     }
+    automaton = sg_pair_snapshot_automaton(snapshot);
   } else {
-    const sg_status load_status = load_base_automaton(graph, memory, model, &automaton);
+    const sg_status load_status = load_base_automaton(graph, memory, model, &owned_automaton);
     if (load_status != SG_OK) {
       set_status_error(result, "model extraction failed", load_status);
       return;
     }
+    automaton = owned_automaton;
   }
   size_t *hypotheses = NULL;
   size_t hypothesis_count = 0U;
   if (!argument_to_ids(automaton, arguments, 1U, false, false, &hypotheses, &hypothesis_count)) {
     set_error(result, "hypotheses must be a nonempty list of known state keys");
     sg_pair_oracle_free(oracle);
-    sg_automaton_free(automaton);
+    sg_pair_snapshot_release(snapshot);
+    sg_automaton_free(owned_automaton);
     return;
   }
   sg_plan_result plan = {0};
-  lazy_record_context lazy = {
-      .graph = graph,
-      .memory = memory,
-      .model = model,
-      .oracle_epoch = metadata.oracle_epoch,
+  snapshot_record_context snapshot_records = {
+      .snapshot = snapshot,
       .metrics = &metrics,
   };
   sg_status status = SG_OK;
   if (source == ORACLE_SOURCE_PERSISTED) {
     const sg_pair_record_source record_source = {
-        .context = &lazy,
-        .read = lazy_record_read,
+        .context = &snapshot_records,
+        .read = snapshot_record_read,
     };
     status =
         sg_plan_disambiguate_from_records(automaton, &record_source, hypotheses, hypothesis_count,
@@ -2237,9 +2207,9 @@ static void plan_disambiguate_impl(struct mgp_list *arguments, struct mgp_graph 
     }
   }
   sg_plan_result_free(&plan);
-  lazy_record_context_free(&lazy);
   sg_pair_oracle_free(oracle);
-  sg_automaton_free(automaton);
+  sg_pair_snapshot_release(snapshot);
+  sg_automaton_free(owned_automaton);
 }
 
 static void plan_disambiguate_cb(struct mgp_list *arguments, struct mgp_graph *graph,
@@ -2430,39 +2400,48 @@ static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *gra
   sg_automaton_free(automaton);
 }
 
-static sg_status overwrite_oracle_records(memgraph_pair_store *store,
-                                          const sg_pair_oracle *oracle) {
+static sg_status persist_snapshot_records(memgraph_pair_store *store,
+                                          const sg_pair_snapshot *snapshot, bool write_all,
+                                          size_t *db_write_batches) {
   sg_pair_record *records = calloc(SG_MATERIALIZE_BATCH, sizeof(*records));
   if (records == NULL) {
     return SG_ERR_ALLOC;
   }
-  const size_t pair_count = sg_pair_oracle_pair_count(oracle);
+  const size_t record_count =
+      write_all ? sg_pair_snapshot_pair_count(snapshot) : sg_pair_snapshot_changed_count(snapshot);
+  const size_t *changed_pairs = sg_pair_snapshot_changed_pairs(snapshot);
   sg_status status = SG_OK;
-  for (size_t first = 0U; status == SG_OK && first < pair_count; first += SG_MATERIALIZE_BATCH) {
-    const size_t remaining = pair_count - first;
+  for (size_t first = 0U; status == SG_OK && first < record_count; first += SG_MATERIALIZE_BATCH) {
+    const size_t remaining = record_count - first;
     const size_t count = remaining < SG_MATERIALIZE_BATCH ? remaining : SG_MATERIALIZE_BATCH;
     for (size_t offset = 0U; status == SG_OK && offset < count; ++offset) {
-      status = sg_pair_oracle_record(oracle, first + offset, &records[offset]);
+      const size_t pair = write_all ? first + offset : changed_pairs[first + offset];
+      status = sg_pair_snapshot_record(snapshot, pair, &records[offset]);
     }
     if (status == SG_OK) {
-      status = memgraph_store_write_records(store, records, count);
+      status = memgraph_store_write_record_batch(store, records, count);
+      if (status == SG_OK) {
+        ++*db_write_batches;
+      }
     }
   }
   free(records);
   return status;
 }
 
-static bool finish_incremental_update(memgraph_pair_store *store) {
+static bool finish_incremental_update(memgraph_pair_store *store, const char *snapshot_token) {
   static const char *query = "MATCH (m:SyncModel {model: $model, oracle_epoch: $oracle_epoch}) "
                              "SET m.generation = $generation, m.prepared_generation = $generation, "
-                             "m.dirty = false, m.incremental = true";
+                             "m.dirty = false, m.incremental = true, "
+                             "m.snapshot_token = $snapshot_token";
   struct mgp_map *params = make_model_params(store->model, store->memory);
   int64_t epoch = 0;
   int64_t generation = 0;
   if (params == NULL || !uint64_to_int64(store->oracle_epoch, &epoch) ||
       !uint64_to_int64(store->updated_generation, &generation) ||
       !params_insert_int(params, "oracle_epoch", epoch, store->memory) ||
-      !params_insert_int(params, "generation", generation, store->memory)) {
+      !params_insert_int(params, "generation", generation, store->memory) ||
+      !params_insert_string(params, "snapshot_token", snapshot_token, store->memory)) {
     if (params != NULL) {
       mgp_map_destroy(params);
     }
@@ -2473,17 +2452,22 @@ static bool finish_incremental_update(memgraph_pair_store *store) {
   return ok;
 }
 
-static bool insert_update_result(struct mgp_result *result, const char *status, uint64_t generation,
+static bool insert_update_result(struct mgp_result *result, const char *status,
+                                 const char *maintenance_mode, uint64_t generation,
                                  uint64_t oracle_epoch, size_t changed_cells,
                                  size_t direct_pair_edges, const sg_pair_repair_metrics *metrics,
-                                 bool fallback_rebuild, uint64_t maintenance_time_us,
-                                 struct mgp_memory *memory) {
+                                 size_t db_write_batches, bool fallback_rebuild,
+                                 uint64_t maintenance_time_us, struct mgp_memory *memory) {
   struct mgp_result_record *record = NULL;
   int64_t converted_generation = 0;
   int64_t converted_epoch = 0;
   int64_t converted_cells = 0;
   int64_t converted_edges = 0;
   int64_t converted_touched = 0;
+  int64_t converted_examined = 0;
+  int64_t converted_written = 0;
+  int64_t converted_edges_examined = 0;
+  int64_t converted_write_batches = 0;
   int64_t converted_merge_changed = 0;
   int64_t converted_merge_invalidated = 0;
   int64_t converted_resolution_changed = 0;
@@ -2494,17 +2478,26 @@ static bool insert_update_result(struct mgp_result *result, const char *status, 
          size_to_int64(changed_cells, &converted_cells) &&
          size_to_int64(direct_pair_edges, &converted_edges) &&
          size_to_int64(metrics->pair_records_touched, &converted_touched) &&
+         size_to_int64(metrics->pair_records_examined, &converted_examined) &&
+         size_to_int64(metrics->pair_records_written, &converted_written) &&
+         size_to_int64(metrics->pair_edges_examined, &converted_edges_examined) &&
+         size_to_int64(db_write_batches, &converted_write_batches) &&
          size_to_int64(metrics->merge_pairs_changed, &converted_merge_changed) &&
          size_to_int64(metrics->merge_pairs_invalidated, &converted_merge_invalidated) &&
          size_to_int64(metrics->resolution_pairs_changed, &converted_resolution_changed) &&
          size_to_int64(metrics->resolution_pairs_invalidated, &converted_resolution_invalidated) &&
          uint64_to_int64(maintenance_time_us, &converted_time) && new_record(result, &record) &&
          insert_string(record, "status", status, memory) &&
+         insert_string(record, "maintenance_mode", maintenance_mode, memory) &&
          insert_int(record, "generation", converted_generation, memory) &&
          insert_int(record, "oracle_epoch", converted_epoch, memory) &&
          insert_int(record, "changed_cells", converted_cells, memory) &&
          insert_int(record, "direct_pair_edges", converted_edges, memory) &&
          insert_int(record, "pair_records_touched", converted_touched, memory) &&
+         insert_int(record, "pair_records_examined", converted_examined, memory) &&
+         insert_int(record, "pair_records_written", converted_written, memory) &&
+         insert_int(record, "pair_edges_examined", converted_edges_examined, memory) &&
+         insert_int(record, "db_write_batches", converted_write_batches, memory) &&
          insert_int(record, "merge_pairs_changed", converted_merge_changed, memory) &&
          insert_int(record, "merge_pairs_invalidated", converted_merge_invalidated, memory) &&
          insert_int(record, "resolution_pairs_changed", converted_resolution_changed, memory) &&
@@ -2514,67 +2507,83 @@ static bool insert_update_result(struct mgp_result *result, const char *status, 
          insert_int(record, "maintenance_time_us", converted_time, memory);
 }
 
+static void set_full_rebuild_metrics(sg_pair_repair_metrics *metrics, size_t pair_count,
+                                     size_t action_count) {
+  metrics->pair_records_touched = pair_count;
+  metrics->pair_records_examined = pair_count;
+  metrics->merge_pairs_changed = pair_count;
+  metrics->resolution_pairs_changed = pair_count;
+  metrics->pair_edges_examined =
+      action_count > SIZE_MAX / pair_count ? SIZE_MAX : pair_count * action_count;
+}
+
 static void update_cells_cb(struct mgp_list *arguments, struct mgp_graph *graph,
                             struct mgp_result *result, struct mgp_memory *memory) {
   const uint64_t start = monotonic_time_us();
   const char *model = NULL;
   int64_t requested_budget = 0;
   if (!get_string_arg(arguments, 0U, &model) ||
-      !get_int_arg_default(arguments, 2U, 0, &requested_budget) || requested_budget < 0 ||
-      (uint64_t)requested_budget > (uint64_t)SIZE_MAX) {
-    set_error(result, "expected model, nonempty cell-change maps, and nonnegative repair budget");
+      !get_int_arg_default(arguments, 2U, 0, &requested_budget) || requested_budget < -1 ||
+      (requested_budget > 0 && (uint64_t)requested_budget > (uint64_t)SIZE_MAX)) {
+    set_error(result, "expected model, cell-change maps, and repair budget -1 or greater");
     return;
   }
+  planning_metrics snapshot_metrics = {0};
   model_metadata metadata = {0};
-  sg_automaton *old_automaton = NULL;
-  if (!load_prepared_automaton(graph, memory, model, &metadata, &old_automaton, result)) {
+  sg_pair_snapshot *base_snapshot = NULL;
+  if (!load_prepared_snapshot(graph, memory, model, &metadata, &snapshot_metrics, &base_snapshot,
+                              result)) {
     return;
   }
   if (!metadata.incremental) {
     set_error(result, "model was not prepared for incremental maintenance");
-    sg_automaton_free(old_automaton);
+    sg_pair_snapshot_release(base_snapshot);
     return;
   }
+  const sg_automaton *old_automaton = sg_pair_snapshot_automaton(base_snapshot);
   cell_change *changes = NULL;
   size_t change_count = 0U;
   if (!parse_cell_changes(old_automaton, arguments, &changes, &change_count)) {
     set_error(result, "changes must be unique valid state/action maps with target and/or output");
-    sg_automaton_free(old_automaton);
+    sg_pair_snapshot_release(base_snapshot);
     return;
   }
   sg_pair_repair_metrics metrics = {0};
   if (change_count == 0U) {
-    if (!insert_update_result(result, "UNCHANGED", metadata.generation, metadata.oracle_epoch, 0U,
-                              0U, &metrics, false, elapsed_us(start), memory)) {
+    if (!insert_update_result(result, "UNCHANGED", "UNCHANGED", metadata.generation,
+                              metadata.oracle_epoch, 0U, 0U, &metrics, 0U, false, elapsed_us(start),
+                              memory)) {
       set_error(result, "failed to create unchanged update result");
     }
     free(changes);
-    sg_automaton_free(old_automaton);
+    sg_pair_snapshot_release(base_snapshot);
     return;
   }
-  if (metadata.generation == UINT64_MAX ||
-      !apply_base_changes(graph, memory, model, changes, change_count)) {
-    set_error(result, "failed to apply base-view cell changes");
+  if (metadata.generation == UINT64_MAX) {
+    set_error(result, "model generation is exhausted");
     free(changes);
-    sg_automaton_free(old_automaton);
+    sg_pair_snapshot_release(base_snapshot);
     return;
   }
   const uint64_t new_generation = metadata.generation + 1U;
-  sg_automaton *automaton = NULL;
-  sg_status status = load_automaton_generation(graph, memory, model, new_generation, &automaton);
-  if (status == SG_OK &&
-      (sg_automaton_state_count(automaton) != sg_automaton_state_count(old_automaton) ||
-       sg_automaton_action_count(automaton) != sg_automaton_action_count(old_automaton) ||
-       sg_automaton_output_count(automaton) != sg_automaton_output_count(old_automaton))) {
-    status = SG_ERR_INVALID_MODEL;
+  sg_pair_snapshot *candidate = NULL;
+  sg_status status = sg_pair_snapshot_clone(base_snapshot, new_generation, &candidate);
+  for (size_t index = 0U; status == SG_OK && index < change_count; ++index) {
+    bool changed = false;
+    status = sg_pair_snapshot_set_cell(candidate, changes[index].state, changes[index].action,
+                                       changes[index].target, changes[index].output, &changed);
+    if (status == SG_OK && !changed) {
+      status = SG_ERR_INVALID_MODEL;
+    }
   }
   if (status != SG_OK) {
-    set_status_error(result, "updated model extraction failed", status);
+    set_status_error(result, "updated snapshot construction failed", status);
     free(changes);
-    sg_automaton_free(automaton);
-    sg_automaton_free(old_automaton);
+    sg_pair_snapshot_release(candidate);
+    sg_pair_snapshot_release(base_snapshot);
     return;
   }
+  const sg_automaton *automaton = sg_pair_snapshot_automaton(candidate);
   pair_edge_update *updates = NULL;
   size_t update_count = 0U;
   size_t *seed_pairs = NULL;
@@ -2589,58 +2598,80 @@ static void update_cells_cb(struct mgp_list *arguments, struct mgp_graph *graph,
       .updated_generation = new_generation,
       .automaton = automaton,
   };
-  if (status == SG_OK) {
-    status = replace_pair_edges(&store_context, updates, update_count);
-  }
-  size_t pair_count = 0U;
-  if (status == SG_OK && !pair_count_for_states(sg_automaton_state_count(automaton), &pair_count)) {
-    status = SG_ERR_ALLOC;
-  }
+  const size_t pair_count = sg_pair_snapshot_pair_count(candidate);
   const size_t automatic_budget = (pair_count / 4U) + (pair_count % 4U != 0U ? 1U : 0U);
   const size_t repair_budget = requested_budget == 0 ? automatic_budget : (size_t)requested_budget;
-  const sg_pair_store pair_store = {
-      .context = &store_context,
-      .state_count = sg_automaton_state_count(automaton),
-      .action_count = sg_automaton_action_count(automaton),
-      .pair_count = pair_count,
-      .read_records = memgraph_store_read_records,
-      .read_outgoing = memgraph_store_read_outgoing,
-      .read_incoming = memgraph_store_read_incoming,
-      .write_records = memgraph_store_write_records,
-  };
   bool fallback_rebuild = false;
-  if (status == SG_OK) {
-    status = sg_pair_store_repair(&pair_store, seed_pairs, seed_count, repair_budget, &metrics);
+  bool full_rebuild = requested_budget == -1;
+  if (status == SG_OK && !full_rebuild) {
+    status = sg_pair_snapshot_repair(candidate, seed_pairs, seed_count, repair_budget, &metrics);
   }
   if (status == SG_ERR_RESOURCE_BOUND) {
-    sg_pair_oracle *oracle = NULL;
-    status = sg_pair_oracle_build(automaton, &oracle);
+    fallback_rebuild = true;
+    full_rebuild = true;
+    status = SG_OK;
+  }
+  if (status == SG_OK && full_rebuild) {
+    sg_pair_snapshot *rebuilt = NULL;
+    status = sg_pair_snapshot_build(sg_pair_snapshot_automaton(candidate), &rebuilt);
     if (status == SG_OK) {
-      status = overwrite_oracle_records(&store_context, oracle);
-    }
-    sg_pair_oracle_free(oracle);
-    if (status == SG_OK) {
-      fallback_rebuild = true;
-      metrics.pair_records_touched = pair_count;
-      metrics.merge_pairs_changed = pair_count;
-      metrics.resolution_pairs_changed = pair_count;
+      sg_pair_snapshot_release(candidate);
+      candidate = rebuilt;
+      automaton = sg_pair_snapshot_automaton(candidate);
+      store_context.automaton = automaton;
+      set_full_rebuild_metrics(&metrics, pair_count, sg_automaton_action_count(automaton));
     }
   }
-  if (status == SG_OK && !finish_incremental_update(&store_context)) {
+  metrics.pair_records_written =
+      full_rebuild ? pair_count : sg_pair_snapshot_changed_count(candidate);
+
+  char snapshot_token[SG_SNAPSHOT_TOKEN_CAPACITY] = {0};
+  bool snapshot_stored = false;
+  if (status == SG_OK && !make_snapshot_token(snapshot_token)) {
+    status = SG_ERR_RESOURCE_BOUND;
+  }
+  if (status == SG_OK) {
+    status = sg_snapshot_cache_insert(snapshot_cache, model, metadata.oracle_epoch, new_generation,
+                                      snapshot_token, candidate, &snapshot_stored);
+  }
+  (void)snapshot_stored;
+
+  size_t db_write_batches = 0U;
+  if (status == SG_OK && !apply_base_changes(graph, memory, model, changes, change_count)) {
     status = SG_ERR_INVALID_MODEL;
+  }
+  if (status == SG_OK) {
+    ++db_write_batches;
+  }
+  if (status == SG_OK && metadata.pair_edges_materialized) {
+    status = replace_pair_edges(&store_context, updates, update_count);
+    if (status == SG_OK && update_count != 0U) {
+      db_write_batches += (update_count / SG_MATERIALIZE_BATCH) +
+                          (update_count % SG_MATERIALIZE_BATCH != 0U ? 1U : 0U);
+    }
+  }
+  if (status == SG_OK) {
+    status = persist_snapshot_records(&store_context, candidate, full_rebuild, &db_write_batches);
+  }
+  if (status == SG_OK && !finish_incremental_update(&store_context, snapshot_token)) {
+    status = SG_ERR_INVALID_MODEL;
+  }
+  if (status == SG_OK) {
+    ++db_write_batches;
   }
   if (status != SG_OK) {
     set_status_error(result, "incremental maintenance failed", status);
-  } else if (!insert_update_result(result, "UPDATED", new_generation, metadata.oracle_epoch,
-                                   change_count, update_count, &metrics, fallback_rebuild,
+  } else if (!insert_update_result(result, "UPDATED", full_rebuild ? "FULL_REBUILD" : "INCREMENTAL",
+                                   new_generation, metadata.oracle_epoch, change_count,
+                                   update_count, &metrics, db_write_batches, fallback_rebuild,
                                    elapsed_us(start), memory)) {
     set_error(result, "failed to create incremental update result");
   }
   free(seed_pairs);
   free(updates);
   free(changes);
-  sg_automaton_free(automaton);
-  sg_automaton_free(old_automaton);
+  sg_pair_snapshot_release(candidate);
+  sg_pair_snapshot_release(base_snapshot);
 }
 
 static void mark_dirty_cb(struct mgp_list *arguments, struct mgp_graph *graph,
@@ -2746,11 +2777,14 @@ static bool add_plan_common_results(struct mgp_proc *procedure, struct mgp_type 
          add_result(procedure, "generation", int_type) &&
          add_result(procedure, "planning_time_us", int_type) &&
          add_result(procedure, "oracle_source", string_type) &&
+         add_result(procedure, "cache_state", string_type) &&
          add_result(procedure, "oracle_builds", int_type) &&
          add_result(procedure, "oracle_rows_loaded", int_type) &&
          add_result(procedure, "oracle_load_batches", int_type) &&
          add_result(procedure, "oracle_cache_hits", int_type) &&
+         add_result(procedure, "snapshot_record_reads", int_type) &&
          add_result(procedure, "oracle_time_us", int_type) &&
+         add_result(procedure, "snapshot_hydration_time_us", int_type) &&
          add_result(procedure, "total_compute_time_us", int_type);
 }
 
@@ -2856,11 +2890,16 @@ static bool register_update_cells(struct mgp_module *module, struct mgp_memory *
          add_required(procedure, "changes", map_list_type) &&
          add_optional_int(procedure, "repair_budget", 0, memory, int_type) &&
          add_result(procedure, "status", string_type) &&
+         add_result(procedure, "maintenance_mode", string_type) &&
          add_result(procedure, "generation", int_type) &&
          add_result(procedure, "oracle_epoch", int_type) &&
          add_result(procedure, "changed_cells", int_type) &&
          add_result(procedure, "direct_pair_edges", int_type) &&
          add_result(procedure, "pair_records_touched", int_type) &&
+         add_result(procedure, "pair_records_examined", int_type) &&
+         add_result(procedure, "pair_records_written", int_type) &&
+         add_result(procedure, "pair_edges_examined", int_type) &&
+         add_result(procedure, "db_write_batches", int_type) &&
          add_result(procedure, "merge_pairs_changed", int_type) &&
          add_result(procedure, "merge_pairs_invalidated", int_type) &&
          add_result(procedure, "resolution_pairs_changed", int_type) &&
@@ -2876,9 +2915,18 @@ int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
   struct mgp_type *list_type = NULL;
   struct mgp_type *map_type = NULL;
   struct mgp_type *map_list_type = NULL;
+  size_t cache_limit = 0U;
+  atomic_store_explicit(&snapshot_counter, UINT64_C(1), memory_order_relaxed);
+  if (snapshot_cache != NULL || !initialize_snapshot_incarnation() ||
+      !snapshot_cache_limit(&cache_limit) ||
+      sg_snapshot_cache_create(cache_limit, &snapshot_cache) != SG_OK) {
+    return 1;
+  }
   if (!mg_ok(mgp_type_string(&string_type)) || !mg_ok(mgp_type_bool(&bool_type)) ||
       !mg_ok(mgp_type_int(&int_type)) || !mg_ok(mgp_type_list(string_type, &list_type)) ||
       !mg_ok(mgp_type_map(&map_type)) || !mg_ok(mgp_type_list(map_type, &map_list_type))) {
+    sg_snapshot_cache_free(snapshot_cache);
+    snapshot_cache = NULL;
     return 1;
   }
   if (!register_prepare(module, memory, string_type, bool_type, int_type) ||
@@ -2894,11 +2942,15 @@ int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
       !register_validate(module, memory, string_type, bool_type, int_type, list_type) ||
       !register_update_cells(module, memory, string_type, bool_type, int_type, map_list_type) ||
       !register_mark_dirty(module, string_type, int_type)) {
+    sg_snapshot_cache_free(snapshot_cache);
+    snapshot_cache = NULL;
     return 1;
   }
   return 0;
 }
 
 int mgp_shutdown_module(void) {
+  sg_snapshot_cache_free(snapshot_cache);
+  snapshot_cache = NULL;
   return 0;
 }

@@ -13,7 +13,8 @@ CREATE INDEX ON :SyncPair(oracle_epoch);
 
 // Application-owned view contract:
 // (:SyncModel {
-//   model, generation, dirty, prepared_generation?, oracle_epoch?, incremental?
+//   model, generation, dirty, prepared_generation?, oracle_epoch?, incremental?,
+//   pair_edges_materialized?, snapshot_token?
 // })
 // (:SyncState {model, state_key, state_id, semantic_ref?, orientation?})
 // (:SyncAction {model, action_key, action_id})
@@ -22,5 +23,5 @@ CREATE INDEX ON :SyncPair(oracle_epoch);
 // (:SyncState)-[:SYNC_OBS {model, action_key}]->(:SyncOutput)
 //
 // sync.prepare_model materializes epoch-scoped SyncPair records.
-// Snapshot visualization mode adds PAIR_NEXT and PAIR_PRE. Incremental mode
-// stores PAIR_NEXT only and must be changed through sync.update_cells.
+// Pair visualization adds PAIR_NEXT and PAIR_PRE. Incremental mode requires
+// SyncPair records, not pair relationships, and must use sync.update_cells.
