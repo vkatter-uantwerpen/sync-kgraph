@@ -193,6 +193,8 @@ static sg_status sg_snapshot_allocate(const sg_automaton *automaton, sg_pair_sna
     const size_t pair_count = created->topology->pair_count;
     created->chunk_count = (pair_count / SG_SNAPSHOT_RECORD_CHUNK) +
                            (pair_count % SG_SNAPSHOT_RECORD_CHUNK != 0U ? 1U : 0U);
+    // The table stores chunk pointers rather than inline chunk objects.
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
     created->chunks = calloc(created->chunk_count, sizeof(*created->chunks));
     if (created->chunks == NULL) {
       status = SG_ERR_ALLOC;
@@ -330,6 +332,8 @@ sg_status sg_pair_snapshot_clone(const sg_pair_snapshot *source, uint64_t genera
     created->topology = source->topology;
     sg_pair_topology_retain(created->topology);
     created->chunk_count = source->chunk_count;
+    // The table stores chunk pointers rather than inline chunk objects.
+    // NOLINTNEXTLINE(bugprone-sizeof-expression)
     created->chunks = calloc(created->chunk_count, sizeof(*created->chunks));
     if (created->chunks == NULL) {
       status = SG_ERR_ALLOC;
@@ -398,6 +402,8 @@ size_t sg_pair_snapshot_memory_bytes(const sg_pair_snapshot *snapshot) {
   }
   const size_t states = sg_automaton_state_count(snapshot->automaton);
   const size_t actions = sg_automaton_action_count(snapshot->automaton);
+  // Account for the pointer table separately from the referenced chunks.
+  // NOLINTNEXTLINE(bugprone-sizeof-expression)
   size_t bytes = sizeof(*snapshot) + (snapshot->chunk_count * sizeof(*snapshot->chunks)) +
                  sizeof(*snapshot->topology) +
                  (snapshot->topology->pair_count * 2U * sizeof(size_t));

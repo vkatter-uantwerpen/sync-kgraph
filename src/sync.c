@@ -504,6 +504,9 @@ sg_status sg_automaton_clone_generation(const sg_automaton *source, uint64_t gen
   if (source == NULL || clone == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
   }
+  if (source->state_count == 0U || source->action_count == 0U || source->output_count == 0U) {
+    return SG_ERR_INVALID_MODEL;
+  }
   *clone = NULL;
   sg_automaton *created = calloc(1U, sizeof(*created));
   if (created == NULL) {
@@ -523,6 +526,9 @@ sg_status sg_automaton_clone_generation(const sg_automaton *source, uint64_t gen
   size_t cells = 0U;
   if (status == SG_OK && !sg_size_multiply(source->state_count, source->action_count, &cells)) {
     status = SG_ERR_ALLOC;
+  }
+  if (status == SG_OK && cells == 0U) {
+    status = SG_ERR_INVALID_MODEL;
   }
   if (status == SG_OK) {
     created->transitions = malloc(cells * sizeof(*created->transitions));
