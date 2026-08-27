@@ -71,6 +71,12 @@ jobs:
       - name: Memgraph smoke
         if: matrix.memgraph-version == '3.11.0'
         run: sh scripts/memgraph_smoke.sh build-memgraph
+      - name: Upload ablation timings
+        if: always() && matrix.memgraph-version == '3.11.0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: memgraph-ablation-timings
+          path: build-memgraph/ablation*.csv
 
   coverage:
     runs-on: ubuntu-latest

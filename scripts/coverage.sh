@@ -28,16 +28,18 @@ esac
 case "${SYNC_KGRAPH_COVERAGE_RUNNER:-auto}" in
 auto)
   if [ -x /usr/lib/memgraph/memgraph ] && command -v mgconsole >/dev/null 2>&1; then
-    sh scripts/memgraph_local_smoke.sh "$builddir"
+    SYNC_KGRAPH_RUN_ABLATION=0 sh scripts/memgraph_local_smoke.sh "$builddir"
   else
-    SYNC_KGRAPH_COVERAGE=1 sh scripts/memgraph_smoke.sh "$builddir"
+    SYNC_KGRAPH_COVERAGE=1 SYNC_KGRAPH_RUN_ABLATION=0 \
+      sh scripts/memgraph_smoke.sh "$builddir"
   fi
   ;;
 local)
-  sh scripts/memgraph_local_smoke.sh "$builddir"
+  SYNC_KGRAPH_RUN_ABLATION=0 sh scripts/memgraph_local_smoke.sh "$builddir"
   ;;
 docker)
-  SYNC_KGRAPH_COVERAGE=1 sh scripts/memgraph_smoke.sh "$builddir"
+  SYNC_KGRAPH_COVERAGE=1 SYNC_KGRAPH_RUN_ABLATION=0 \
+    sh scripts/memgraph_smoke.sh "$builddir"
   ;;
 *)
   echo "SYNC_KGRAPH_COVERAGE_RUNNER must be auto, local, or docker" >&2

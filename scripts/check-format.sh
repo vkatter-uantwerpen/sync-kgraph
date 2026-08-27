@@ -3,6 +3,8 @@ set -eu
 
 clang-format --dry-run --Werror \
   include/sync_kgraph/sync.h \
+  src/dynamic.c \
+  src/dynamic.h \
   src/oracle.c \
   src/planner.c \
   src/sync.c \

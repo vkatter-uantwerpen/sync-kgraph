@@ -256,6 +256,186 @@ static uint64_t sg_elapsed_us(uint64_t start) {
   return end >= start ? end - start : 0U;
 }
 
+typedef enum {
+  SG_WITNESS_MERGE = 0,
+  SG_WITNESS_RESOLUTION,
+} sg_witness_kind;
+
+static bool sg_planner_pair_count(size_t state_count, size_t *pair_count) {
+  size_t product = 0U;
+  if (state_count == SIZE_MAX || !sg_size_multiply(state_count, state_count + 1U, &product)) {
+    return false;
+  }
+  *pair_count = product / 2U;
+  return true;
+}
+
+static sg_status sg_oracle_record_reader(void *context, const size_t *pair_ids, size_t pair_count,
+                                         sg_pair_record *records) {
+  const sg_pair_oracle *oracle = context;
+  for (size_t index = 0U; index < pair_count; ++index) {
+    const sg_status status = sg_pair_oracle_record(oracle, pair_ids[index], &records[index]);
+    if (status != SG_OK) {
+      return status;
+    }
+  }
+  return SG_OK;
+}
+
+static void sg_words_free(sg_word *words, size_t count) {
+  if (words == NULL) {
+    return;
+  }
+  for (size_t index = 0U; index < count; ++index) {
+    sg_word_free(&words[index]);
+  }
+}
+
+static sg_status sg_pair_words_load(const sg_automaton *automaton,
+                                    const sg_pair_record_source *source, const size_t *first_states,
+                                    const size_t *second_states, size_t candidate_count,
+                                    sg_witness_kind kind, sg_word *words, bool *available) {
+  if (source == NULL || source->read == NULL || first_states == NULL || second_states == NULL ||
+      words == NULL || available == NULL) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  size_t pair_count = 0U;
+  if (!sg_planner_pair_count(automaton->state_count, &pair_count)) {
+    return SG_ERR_ALLOC;
+  }
+  size_t *current_first = calloc(candidate_count, sizeof(*current_first));
+  size_t *current_second = calloc(candidate_count, sizeof(*current_second));
+  size_t *pair_ids = calloc(candidate_count, sizeof(*pair_ids));
+  size_t *expected_distances = calloc(candidate_count, sizeof(*expected_distances));
+  size_t *positions = calloc(candidate_count, sizeof(*positions));
+  sg_pair_record *records = calloc(candidate_count, sizeof(*records));
+  bool *active = calloc(candidate_count, sizeof(*active));
+  if (current_first == NULL || current_second == NULL || pair_ids == NULL ||
+      expected_distances == NULL || positions == NULL || records == NULL || active == NULL) {
+    free(current_first);
+    free(current_second);
+    free(pair_ids);
+    free(expected_distances);
+    free(positions);
+    free(records);
+    free(active);
+    return SG_ERR_ALLOC;
+  }
+  sg_status status = SG_OK;
+  size_t active_count = candidate_count;
+  for (size_t index = 0U; index < candidate_count; ++index) {
+    status = sg_word_init(&words[index]);
+    if (status != SG_OK) {
+      sg_words_free(words, index);
+      break;
+    }
+    current_first[index] = first_states[index];
+    current_second[index] = second_states[index];
+    pair_ids[index] =
+        sg_pair_index(automaton->state_count, first_states[index], second_states[index]);
+    expected_distances[index] = SG_INDEX_NONE;
+    available[index] = true;
+    active[index] = true;
+  }
+  for (size_t depth = 0U; status == SG_OK && active_count != 0U && depth <= pair_count; ++depth) {
+    size_t request_count = 0U;
+    for (size_t index = 0U; index < candidate_count; ++index) {
+      if (active[index]) {
+        positions[request_count] = index;
+        pair_ids[request_count] =
+            sg_pair_index(automaton->state_count, current_first[index], current_second[index]);
+        ++request_count;
+      }
+    }
+    status = source->read(source->context, pair_ids, request_count, records);
+    for (size_t request = 0U; status == SG_OK && request < request_count; ++request) {
+      const size_t index = positions[request];
+      const sg_pair_record record = records[request];
+      const size_t pair = pair_ids[request];
+      const bool reachable = kind == SG_WITNESS_MERGE ? record.mergeable : record.resolvable;
+      const size_t distance =
+          kind == SG_WITNESS_MERGE ? record.merge_distance : record.resolution_distance;
+      const size_t action =
+          kind == SG_WITNESS_MERGE ? record.merge_action : record.resolution_action;
+      const size_t next =
+          kind == SG_WITNESS_MERGE ? record.merge_next_pair : record.resolution_next_pair;
+      const size_t supports =
+          kind == SG_WITNESS_MERGE ? record.merge_support_count : record.resolution_support_count;
+      if (record.pair != pair) {
+        status = SG_ERR_INVALID_MODEL;
+        break;
+      }
+      if (!reachable) {
+        if (words[index].length != 0U || distance != SG_INDEX_NONE || action != SG_INDEX_NONE ||
+            next != SG_INDEX_NONE || supports != 0U) {
+          status = SG_ERR_INVALID_MODEL;
+          break;
+        }
+        available[index] = false;
+        active[index] = false;
+        --active_count;
+        continue;
+      }
+      if ((expected_distances[index] != SG_INDEX_NONE && distance != expected_distances[index]) ||
+          (distance == 0U && current_first[index] != current_second[index])) {
+        status = SG_ERR_INVALID_MODEL;
+        break;
+      }
+      if (distance == 0U) {
+        if (action != SG_INDEX_NONE || next != SG_INDEX_NONE || supports != 0U) {
+          status = SG_ERR_INVALID_MODEL;
+          break;
+        }
+        active[index] = false;
+        --active_count;
+        continue;
+      }
+      if (action >= automaton->action_count || supports == 0U ||
+          sg_word_append(&words[index], action) != SG_OK) {
+        status = action >= automaton->action_count || supports == 0U ? SG_ERR_INVALID_MODEL
+                                                                     : SG_ERR_ALLOC;
+        break;
+      }
+      const size_t first_next = sg_automaton_transition(automaton, current_first[index], action);
+      const size_t second_next = sg_automaton_transition(automaton, current_second[index], action);
+      const size_t expected_next = sg_pair_index(automaton->state_count, first_next, second_next);
+      const bool outputs_differ =
+          sg_automaton_observation(automaton, current_first[index], action) !=
+          sg_automaton_observation(automaton, current_second[index], action);
+      if (kind == SG_WITNESS_RESOLUTION && next == SG_INDEX_NONE) {
+        if (distance != 1U || !outputs_differ) {
+          status = SG_ERR_INVALID_MODEL;
+          break;
+        }
+        active[index] = false;
+        --active_count;
+        continue;
+      }
+      if (next != expected_next || (kind == SG_WITNESS_RESOLUTION && outputs_differ)) {
+        status = SG_ERR_INVALID_MODEL;
+        break;
+      }
+      current_first[index] = first_next;
+      current_second[index] = second_next;
+      expected_distances[index] = distance - 1U;
+    }
+    if (depth == pair_count && active_count != 0U) {
+      status = SG_ERR_INVALID_MODEL;
+    }
+  }
+  if (status != SG_OK) {
+    sg_words_free(words, candidate_count);
+  }
+  free(current_first);
+  free(current_second);
+  free(pair_ids);
+  free(expected_distances);
+  free(positions);
+  free(records);
+  free(active);
+  return status;
+}
+
 static bool sg_sync_candidate_better(size_t count, size_t length, size_t pair, size_t best_count,
                                      size_t best_length, size_t best_pair) {
   return count < best_count ||
@@ -263,50 +443,88 @@ static bool sg_sync_candidate_better(size_t count, size_t length, size_t pair, s
           (length < best_length || (length == best_length && pair < best_pair)));
 }
 
-static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_record_source *source,
                                const sg_bitset *active, sg_word *best_word,
                                sg_bitset *best_support) {
-  size_t best_count = SG_INDEX_NONE;
-  size_t best_length = SG_INDEX_NONE;
-  size_t best_pair = SG_INDEX_NONE;
-  sg_status status = SG_ERR_NOT_FOUND;
+  const size_t active_count = sg_bitset_count(active);
+  size_t product = 0U;
+  if (active_count < 2U || !sg_size_multiply(active_count, active_count - 1U, &product)) {
+    return active_count < 2U ? SG_ERR_NOT_FOUND : SG_ERR_ALLOC;
+  }
+  const size_t candidate_count = product / 2U;
+  size_t *first_states = calloc(candidate_count, sizeof(*first_states));
+  size_t *second_states = calloc(candidate_count, sizeof(*second_states));
+  sg_word *words = calloc(candidate_count, sizeof(*words));
+  bool *available = calloc(candidate_count, sizeof(*available));
+  if (first_states == NULL || second_states == NULL || words == NULL || available == NULL) {
+    free(first_states);
+    free(second_states);
+    free(words);
+    free(available);
+    return SG_ERR_ALLOC;
+  }
+  size_t candidate = 0U;
   for (size_t first = 0U; first < automaton->state_count; ++first) {
     if (!sg_bitset_has(active, first)) {
       continue;
     }
     for (size_t second = first + 1U; second < automaton->state_count; ++second) {
-      if (!sg_bitset_has(active, second)) {
-        continue;
-      }
-      sg_word candidate_word = {0};
-      if (sg_pair_oracle_merge_word(oracle, first, second, &candidate_word) != SG_OK) {
-        continue;
-      }
-      sg_bitset candidate_support = {0};
-      status = sg_apply_word_set(automaton, active, &candidate_word, &candidate_support);
-      if (status != SG_OK) {
-        sg_word_free(&candidate_word);
-        return status;
-      }
-      const size_t count = sg_bitset_count(&candidate_support);
-      const size_t pair = sg_pair_index(automaton->state_count, first, second);
-      if (sg_sync_candidate_better(count, candidate_word.length, pair, best_count, best_length,
-                                   best_pair)) {
-        sg_word_free(best_word);
-        sg_bitset_free(best_support);
-        *best_word = candidate_word;
-        *best_support = candidate_support;
-        best_count = count;
-        best_length = candidate_word.length;
-        best_pair = pair;
-        status = SG_OK;
-      } else {
-        sg_word_free(&candidate_word);
-        sg_bitset_free(&candidate_support);
+      if (sg_bitset_has(active, second)) {
+        first_states[candidate] = first;
+        second_states[candidate] = second;
+        ++candidate;
       }
     }
   }
-  return best_pair == SG_INDEX_NONE ? SG_ERR_NOT_FOUND : status;
+  sg_status status = sg_pair_words_load(automaton, source, first_states, second_states,
+                                        candidate_count, SG_WITNESS_MERGE, words, available);
+  if (status != SG_OK) {
+    free(first_states);
+    free(second_states);
+    free(words);
+    free(available);
+    return status;
+  }
+  size_t best_count = SG_INDEX_NONE;
+  size_t best_length = SG_INDEX_NONE;
+  size_t best_pair = SG_INDEX_NONE;
+  status = SG_ERR_NOT_FOUND;
+  for (size_t index = 0U; index < candidate_count; ++index) {
+    if (!available[index]) {
+      continue;
+    }
+    sg_bitset candidate_support = {0};
+    status = sg_apply_word_set(automaton, active, &words[index], &candidate_support);
+    if (status != SG_OK) {
+      break;
+    }
+    const size_t count = sg_bitset_count(&candidate_support);
+    const size_t pair =
+        sg_pair_index(automaton->state_count, first_states[index], second_states[index]);
+    if (sg_sync_candidate_better(count, words[index].length, pair, best_count, best_length,
+                                 best_pair)) {
+      sg_word_free(best_word);
+      sg_bitset_free(best_support);
+      *best_word = words[index];
+      words[index] = (sg_word){0};
+      *best_support = candidate_support;
+      best_count = count;
+      best_length = best_word->length;
+      best_pair = pair;
+      status = SG_OK;
+    } else {
+      sg_bitset_free(&candidate_support);
+    }
+  }
+  sg_words_free(words, candidate_count);
+  free(first_states);
+  free(second_states);
+  free(words);
+  free(available);
+  if (status != SG_OK && status != SG_ERR_NOT_FOUND) {
+    return status;
+  }
+  return best_pair == SG_INDEX_NONE ? SG_ERR_NOT_FOUND : SG_OK;
 }
 
 static void sg_trace_partition_free(sg_trace_partition *partition) {
@@ -508,11 +726,12 @@ static sg_status sg_sync_finalize(const sg_automaton *automaton, const sg_bitset
   return status;
 }
 
-sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
-                       const size_t *initial_states, size_t initial_count, size_t budget,
-                       sg_plan_result *result) {
-  if (automaton == NULL || oracle == NULL || oracle->automaton != automaton ||
-      initial_states == NULL || initial_count == 0U || budget == 0U || result == NULL) {
+static sg_status sg_plan_sync_with_source(const sg_automaton *automaton,
+                                          const sg_pair_record_source *source,
+                                          const size_t *initial_states, size_t initial_count,
+                                          size_t budget, sg_plan_result *result) {
+  if (automaton == NULL || source == NULL || source->read == NULL || initial_states == NULL ||
+      initial_count == 0U || budget == 0U || result == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
   }
   const uint64_t start = sg_monotonic_time_us();
@@ -543,7 +762,7 @@ sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *orac
     }
     sg_word witness = {0};
     sg_bitset next = {0};
-    status = sg_best_merge(automaton, oracle, &active, &witness, &next);
+    status = sg_best_merge(automaton, source, &active, &witness, &next);
     if (status == SG_ERR_NOT_FOUND) {
       result->outcome = SG_OUTCOME_NO_PLAN;
       status = SG_OK;
@@ -576,6 +795,27 @@ sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *orac
   return status;
 }
 
+sg_status sg_plan_sync_from_records(const sg_automaton *automaton,
+                                    const sg_pair_record_source *source,
+                                    const size_t *initial_states, size_t initial_count,
+                                    size_t budget, sg_plan_result *result) {
+  return sg_plan_sync_with_source(automaton, source, initial_states, initial_count, budget, result);
+}
+
+sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                       const size_t *initial_states, size_t initial_count, size_t budget,
+                       sg_plan_result *result) {
+  if (oracle == NULL || oracle->automaton != automaton) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  const sg_pair_record_source source = {
+      .context = (void *)oracle,
+      .read = sg_oracle_record_reader,
+  };
+  return sg_plan_sync_with_source(automaton, &source, initial_states, initial_count, budget,
+                                  result);
+}
+
 static bool sg_resolution_candidate_better(size_t worst, size_t length, size_t branches,
                                            size_t pair, size_t best_worst, size_t best_length,
                                            size_t best_branches, size_t best_pair) {
@@ -586,7 +826,8 @@ static bool sg_resolution_candidate_better(size_t worst, size_t length, size_t b
             (branches > best_branches || (branches == best_branches && pair < best_pair)))));
 }
 
-static sg_status sg_best_resolution(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+static sg_status sg_best_resolution(const sg_automaton *automaton,
+                                    const sg_pair_record_source *record_source,
                                     const sg_bitset *initial, size_t current_worst,
                                     sg_word *best_word, sg_trace_partition *best_partition) {
   sg_trace_partition source = {0};
@@ -594,54 +835,88 @@ static sg_status sg_best_resolution(const sg_automaton *automaton, const sg_pair
   if (status != SG_OK) {
     return status;
   }
-  size_t best_worst = SG_INDEX_NONE;
-  size_t best_length = SG_INDEX_NONE;
-  size_t best_branches = 0U;
-  size_t best_pair = SG_INDEX_NONE;
+  const size_t initial_count = sg_bitset_count(initial);
+  size_t product = 0U;
+  if (initial_count < 2U || !sg_size_multiply(initial_count, initial_count - 1U, &product)) {
+    sg_trace_partition_free(&source);
+    return initial_count < 2U ? SG_ERR_NOT_FOUND : SG_ERR_ALLOC;
+  }
+  const size_t candidate_count = product / 2U;
+  size_t *first_states = calloc(candidate_count, sizeof(*first_states));
+  size_t *second_states = calloc(candidate_count, sizeof(*second_states));
+  sg_word *words = calloc(candidate_count, sizeof(*words));
+  bool *available = calloc(candidate_count, sizeof(*available));
+  if (first_states == NULL || second_states == NULL || words == NULL || available == NULL) {
+    free(first_states);
+    free(second_states);
+    free(words);
+    free(available);
+    sg_trace_partition_free(&source);
+    return SG_ERR_ALLOC;
+  }
+  size_t candidate = 0U;
   for (size_t first = 0U; first < automaton->state_count; ++first) {
     if (!sg_bitset_has(initial, first)) {
       continue;
     }
     for (size_t second = first + 1U; second < automaton->state_count; ++second) {
-      if (!sg_bitset_has(initial, second)) {
-        continue;
-      }
-      sg_word candidate_word = {0};
-      if (sg_pair_oracle_resolution_word(oracle, first, second, &candidate_word) != SG_OK) {
-        continue;
-      }
-      sg_trace_partition candidate_partition = {0};
-      status =
-          sg_trace_partition_apply_word(automaton, &source, &candidate_word, &candidate_partition);
-      if (status != SG_OK) {
-        sg_word_free(&candidate_word);
-        break;
-      }
-      size_t best = 0U;
-      size_t worst = 0U;
-      size_t total = 0U;
-      sg_trace_metrics(&candidate_partition, &best, &worst, &total);
-      const size_t pair = sg_pair_index(automaton->state_count, first, second);
-      if (sg_resolution_candidate_better(worst, candidate_word.length, candidate_partition.count,
-                                         pair, best_worst, best_length, best_branches, best_pair)) {
-        sg_word_free(best_word);
-        sg_trace_partition_free(best_partition);
-        *best_word = candidate_word;
-        *best_partition = candidate_partition;
-        best_worst = worst;
-        best_length = candidate_word.length;
-        best_branches = candidate_partition.count;
-        best_pair = pair;
-      } else {
-        sg_word_free(&candidate_word);
-        sg_trace_partition_free(&candidate_partition);
+      if (sg_bitset_has(initial, second)) {
+        first_states[candidate] = first;
+        second_states[candidate] = second;
+        ++candidate;
       }
     }
+  }
+  status = sg_pair_words_load(automaton, record_source, first_states, second_states,
+                              candidate_count, SG_WITNESS_RESOLUTION, words, available);
+  if (status != SG_OK) {
+    free(first_states);
+    free(second_states);
+    free(words);
+    free(available);
+    sg_trace_partition_free(&source);
+    return status;
+  }
+  size_t best_worst = SG_INDEX_NONE;
+  size_t best_length = SG_INDEX_NONE;
+  size_t best_branches = 0U;
+  size_t best_pair = SG_INDEX_NONE;
+  for (size_t index = 0U; index < candidate_count; ++index) {
+    if (!available[index]) {
+      continue;
+    }
+    sg_trace_partition candidate_partition = {0};
+    status = sg_trace_partition_apply_word(automaton, &source, &words[index], &candidate_partition);
     if (status != SG_OK) {
       break;
     }
+    size_t best = 0U;
+    size_t worst = 0U;
+    size_t total = 0U;
+    sg_trace_metrics(&candidate_partition, &best, &worst, &total);
+    const size_t pair =
+        sg_pair_index(automaton->state_count, first_states[index], second_states[index]);
+    if (sg_resolution_candidate_better(worst, words[index].length, candidate_partition.count, pair,
+                                       best_worst, best_length, best_branches, best_pair)) {
+      sg_word_free(best_word);
+      sg_trace_partition_free(best_partition);
+      *best_word = words[index];
+      words[index] = (sg_word){0};
+      *best_partition = candidate_partition;
+      best_worst = worst;
+      best_length = best_word->length;
+      best_branches = candidate_partition.count;
+      best_pair = pair;
+    } else {
+      sg_trace_partition_free(&candidate_partition);
+    }
   }
   sg_trace_partition_free(&source);
+  sg_words_free(words, candidate_count);
+  free(first_states);
+  free(second_states);
+  free(words);
+  free(available);
   if (status != SG_OK) {
     sg_word_free(best_word);
     sg_trace_partition_free(best_partition);
@@ -914,12 +1189,13 @@ static sg_status sg_disambiguation_finalize(const sg_automaton *automaton, const
   return status;
 }
 
-sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_oracle *oracle,
-                               const size_t *initial_states, size_t initial_count, size_t bound,
-                               size_t budget, sg_plan_result *result) {
-  if (automaton == NULL || oracle == NULL || oracle->automaton != automaton ||
-      initial_states == NULL || initial_count == 0U || bound == 0U || budget == 0U ||
-      result == NULL) {
+static sg_status sg_plan_disambiguate_with_source(const sg_automaton *automaton,
+                                                  const sg_pair_record_source *source,
+                                                  const size_t *initial_states,
+                                                  size_t initial_count, size_t bound, size_t budget,
+                                                  sg_plan_result *result) {
+  if (automaton == NULL || source == NULL || source->read == NULL || initial_states == NULL ||
+      initial_count == 0U || bound == 0U || budget == 0U || result == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
   }
   const uint64_t start = sg_monotonic_time_us();
@@ -941,7 +1217,7 @@ sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_orac
   } else {
     sg_word heuristic = {0};
     sg_trace_partition heuristic_partition = {0};
-    status = sg_best_resolution(automaton, oracle, &initial, unique_count, &heuristic,
+    status = sg_best_resolution(automaton, source, &initial, unique_count, &heuristic,
                                 &heuristic_partition);
     if (status == SG_OK) {
       size_t best = 0U;
@@ -975,6 +1251,28 @@ sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_orac
     sg_plan_result_free(result);
   }
   return status;
+}
+
+sg_status sg_plan_disambiguate_from_records(const sg_automaton *automaton,
+                                            const sg_pair_record_source *source,
+                                            const size_t *initial_states, size_t initial_count,
+                                            size_t bound, size_t budget, sg_plan_result *result) {
+  return sg_plan_disambiguate_with_source(automaton, source, initial_states, initial_count, bound,
+                                          budget, result);
+}
+
+sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                               const size_t *initial_states, size_t initial_count, size_t bound,
+                               size_t budget, sg_plan_result *result) {
+  if (oracle == NULL || oracle->automaton != automaton) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  const sg_pair_record_source source = {
+      .context = (void *)oracle,
+      .read = sg_oracle_record_reader,
+  };
+  return sg_plan_disambiguate_with_source(automaton, &source, initial_states, initial_count, bound,
+                                          budget, result);
 }
 
 static sg_status sg_explain_partition(const sg_trace_partition *partition,

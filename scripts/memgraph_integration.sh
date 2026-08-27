@@ -84,29 +84,75 @@ CALL mg.procedures() YIELD name
 WITH name
 WHERE name STARTS WITH "sync."
 WITH count(name) AS procedures
-RETURN CASE WHEN procedures = 6 THEN "PASS" ELSE "FAIL" END AS result;'
+RETURN CASE WHEN procedures = 9 THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "uncached synchronization before preparation" '
+CALL sync.plan_sync_uncached(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, method, word, length, final_state_key,
+      final_support_size, generation, oracle_source, oracle_builds,
+      oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
+      oracle_time_us, total_compute_time_us
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND method = "PAIR_MERGE"
+                 AND word = ["to_corridor", "go_west"] AND length = 2
+                 AND final_state_key = "dock:north"
+                 AND final_support_size = 1 AND generation = 1
+                 AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+                 AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
+                 AND oracle_cache_hits = 0
+                 AND oracle_time_us >= 0 AND total_compute_time_us >= oracle_time_us
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "uncached disambiguation before preparation" '
+CALL sync.plan_disambiguate_uncached(
+  "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
+YIELD status, outcome, method, word, length, best_support_size,
+      worst_support_size, branch_count, homing, generation,
+      oracle_source, oracle_builds, oracle_rows_loaded,
+      oracle_load_batches, oracle_cache_hits
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND method = "PAIR_RESOLUTION" AND word = ["to_corridor"]
+                 AND length = 1 AND best_support_size = 1
+                 AND worst_support_size = 1 AND branch_count = 2
+                 AND homing AND generation = 1
+                 AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+                 AND oracle_rows_loaded = 0 AND oracle_load_batches = 0
+                 AND oracle_cache_hits = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "uncached planning leaves auxiliary graph empty" '
+MATCH (m:SyncModel {model: "warehouse"})
+OPTIONAL MATCH (p:SyncPair {model: "warehouse"})
+WITH m, count(p) AS pairs
+OPTIONAL MATCH ()-[r:PAIR_NEXT|PAIR_PRE {model: "warehouse"}]->()
+WITH m, pairs, count(r) AS edges
+RETURN CASE WHEN m.dirty AND m.prepared_generation IS NULL
+                 AND pairs = 0 AND edges = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "prepare model" '
 CALL sync.prepare_model("warehouse", true)
-YIELD status, generation, states, actions, outputs, transitions, pairs,
-      pair_edges, mergeable_pairs, resolvable_pairs, materialized_pair_edges
-RETURN CASE WHEN status = "OK" AND generation = 1 AND states = 5
+YIELD status, generation, oracle_epoch, states, actions, outputs, transitions,
+      pairs, pair_edges, mergeable_pairs, resolvable_pairs,
+      materialized_pair_edges, incremental_enabled
+RETURN CASE WHEN status = "OK" AND generation = 1 AND oracle_epoch = 1 AND states = 5
                  AND actions = 4 AND outputs = 4 AND transitions = 20
                  AND pairs = 15 AND pair_edges = 60
                  AND mergeable_pairs = 15 AND resolvable_pairs = 15
-                 AND materialized_pair_edges
+                 AND materialized_pair_edges AND NOT incremental_enabled
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "materialized pair records" '
-MATCH (p:SyncPair {model: "warehouse", generation: 1})
+MATCH (p:SyncPair {model: "warehouse", oracle_epoch: 1})
 WITH count(p) AS pairs
-OPTIONAL MATCH (:SyncPair {model: "warehouse", generation: 1})
-               -[n:PAIR_NEXT {model: "warehouse", generation: 1}]->
-               (:SyncPair {model: "warehouse", generation: 1})
+OPTIONAL MATCH (:SyncPair {model: "warehouse", oracle_epoch: 1})
+               -[n:PAIR_NEXT {model: "warehouse", oracle_epoch: 1}]->
+               (:SyncPair {model: "warehouse", oracle_epoch: 1})
 WITH pairs, count(n) AS next_edges
-OPTIONAL MATCH (:SyncPair {model: "warehouse", generation: 1})
-               -[p:PAIR_PRE {model: "warehouse", generation: 1}]->
-               (:SyncPair {model: "warehouse", generation: 1})
+OPTIONAL MATCH (:SyncPair {model: "warehouse", oracle_epoch: 1})
+               -[p:PAIR_PRE {model: "warehouse", oracle_epoch: 1}]->
+               (:SyncPair {model: "warehouse", oracle_epoch: 1})
 WITH pairs, next_edges, count(p) AS pre_edges
 RETURN CASE WHEN pairs = 15 AND next_edges = 60 AND pre_edges = 60
             THEN "PASS" ELSE "FAIL" END AS result;'
@@ -115,24 +161,35 @@ assert_pass "synchronization plan" '
 CALL sync.plan_sync(
   "warehouse", ["west_bay:east", "east_bay:west"], 64)
 YIELD status, outcome, method, word, length, final_state_key,
-      final_support_size, generation
+      final_support_size, generation, oracle_source, oracle_builds,
+      oracle_rows_loaded, oracle_load_batches, oracle_cache_hits,
+      oracle_time_us, total_compute_time_us
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND method = "PAIR_MERGE"
                  AND word = ["to_corridor", "go_west"] AND length = 2
                  AND final_state_key = "dock:north"
                  AND final_support_size = 1 AND generation = 1
+                 AND oracle_source = "PERSISTED" AND oracle_builds = 0
+                 AND oracle_rows_loaded > 0 AND oracle_rows_loaded < 15
+                 AND oracle_load_batches > 0 AND oracle_cache_hits >= 0
+                 AND oracle_time_us >= 0 AND total_compute_time_us >= oracle_time_us
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "disambiguation plan" '
 CALL sync.plan_disambiguate(
   "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
 YIELD status, outcome, method, word, length, best_support_size,
-      worst_support_size, branch_count, homing, generation
+      worst_support_size, branch_count, homing, generation,
+      oracle_source, oracle_builds, oracle_rows_loaded,
+      oracle_load_batches, oracle_cache_hits
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND method = "PAIR_RESOLUTION" AND word = ["to_corridor"]
                  AND length = 1 AND best_support_size = 1
                  AND worst_support_size = 1 AND branch_count = 2
                  AND homing AND generation = 1
+                 AND oracle_source = "PERSISTED" AND oracle_builds = 0
+                 AND oracle_rows_loaded > 0 AND oracle_rows_loaded < 15
+                 AND oracle_load_batches > 0 AND oracle_cache_hits >= 0
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "plan explanation" '
@@ -217,6 +274,15 @@ CALL sync.plan_sync(
   "warehouse", ["west_bay:east", "east_bay:west"], 64)
 YIELD status RETURN status;'
 
+assert_pass "uncached planning accepts dirty model" '
+CALL sync.plan_sync_uncached(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND word = ["to_corridor", "go_west"] AND generation = 2
+                 AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
 assert_pass "old plan is stale after model change" '
 CALL sync.validate_update(
   "warehouse", 1,
@@ -229,17 +295,196 @@ RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION"
 
 assert_pass "reprepare without pair edges" '
 CALL sync.prepare_model("warehouse", false)
-YIELD status, generation, pairs, pair_edges, materialized_pair_edges
-RETURN CASE WHEN status = "OK" AND generation = 2 AND pairs = 15
-                 AND pair_edges = 60 AND NOT materialized_pair_edges
+YIELD status, generation, oracle_epoch, pairs, pair_edges,
+      materialized_pair_edges, incremental_enabled
+RETURN CASE WHEN status = "OK" AND generation = 2 AND oracle_epoch = 2
+                 AND pairs = 15 AND pair_edges = 60
+                 AND NOT materialized_pair_edges AND NOT incremental_enabled
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "optional pair edges removed" '
-MATCH (p:SyncPair {model: "warehouse", generation: 2})
+MATCH (p:SyncPair {model: "warehouse", oracle_epoch: 2})
 WITH count(p) AS pairs
 OPTIONAL MATCH (:SyncPair {model: "warehouse"})-[r:PAIR_NEXT|PAIR_PRE]->()
 WITH pairs, count(r) AS edges
 RETURN CASE WHEN pairs = 15 AND edges = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "cached planning does not require pair relationships" '
+CALL sync.plan_sync(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND word = ["to_corridor", "go_west"] AND generation = 2
+                 AND oracle_source = "PERSISTED" AND oracle_builds = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+run_query '
+MATCH (p:SyncPair {model: "warehouse"}) DETACH DELETE p;'
+
+expect_failure "cached planning requires pair records" '
+CALL sync.plan_sync(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status RETURN status;'
+
+assert_pass "uncached planning ignores missing pair records" '
+CALL sync.plan_sync_uncached(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, method, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND method = "PAIR_MERGE"
+                 AND word = ["to_corridor", "go_west"] AND generation = 2
+                 AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "uncached planning does not recreate pair records" '
+MATCH (p:SyncPair {model: "warehouse"})
+WITH count(p) AS pairs
+RETURN CASE WHEN pairs = 0 THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "prepare incremental oracle" '
+CALL sync.prepare_model("warehouse", false, true)
+YIELD status, generation, oracle_epoch, pairs, pair_edges,
+      materialized_pair_edges, incremental_enabled
+RETURN CASE WHEN status = "OK" AND generation = 2 AND oracle_epoch = 3
+                 AND pairs = 15 AND pair_edges = 60
+                 AND materialized_pair_edges AND incremental_enabled
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "incremental oracle stores forward edges only" '
+MATCH (p:SyncPair {model: "warehouse", oracle_epoch: 3})
+WITH count(p) AS pairs
+OPTIONAL MATCH (:SyncPair {model: "warehouse", oracle_epoch: 3})
+               -[n:PAIR_NEXT {model: "warehouse", oracle_epoch: 3}]->
+               (:SyncPair {model: "warehouse", oracle_epoch: 3})
+WITH pairs, count(n) AS next_edges
+OPTIONAL MATCH ()-[p:PAIR_PRE {model: "warehouse", oracle_epoch: 3}]->()
+WITH pairs, next_edges, count(p) AS pre_edges
+RETURN CASE WHEN pairs = 15 AND next_edges = 60 AND pre_edges = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "incremental no-op preserves generation" '
+CALL sync.update_cells("warehouse", [{
+  state_key: "east_bay:west",
+  action_key: "to_wall",
+  output_key: "symmetric"
+}], 15)
+YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
+      pair_records_touched, fallback_rebuild
+RETURN CASE WHEN status = "UNCHANGED" AND generation = 2 AND oracle_epoch = 3
+                 AND changed_cells = 0 AND direct_pair_edges = 0
+                 AND pair_records_touched = 0 AND NOT fallback_rebuild
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "incremental local repair" '
+CALL sync.update_cells("warehouse", [{
+  state_key: "east_bay:west",
+  action_key: "to_wall",
+  output_key: "east_landmark"
+}], 15)
+YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
+      pair_records_touched, fallback_rebuild, maintenance_time_us
+RETURN CASE WHEN status = "UPDATED" AND generation = 3 AND oracle_epoch = 3
+                 AND changed_cells = 1 AND direct_pair_edges = 5
+                 AND pair_records_touched >= 4 AND pair_records_touched <= 15
+                 AND NOT fallback_rebuild AND maintenance_time_us >= 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "local repair advances only affected edge generation" '
+MATCH (m:SyncModel {model: "warehouse"})
+OPTIONAL MATCH ()-[n:PAIR_NEXT {
+  model: "warehouse", oracle_epoch: 3, updated_generation: 3
+}]->()
+WITH m, count(n) AS updated_edges
+OPTIONAL MATCH ()-[p:PAIR_PRE {model: "warehouse", oracle_epoch: 3}]->()
+WITH m, updated_edges, count(p) AS pre_edges
+RETURN CASE WHEN NOT m.dirty AND m.generation = 3
+                 AND m.prepared_generation = 3 AND m.oracle_epoch = 3
+                 AND m.incremental AND updated_edges = 5 AND pre_edges = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "cached plan after local repair" '
+CALL sync.plan_disambiguate(
+  "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
+YIELD status, outcome, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND word = ["to_corridor"] AND generation = 3
+                 AND oracle_source = "PERSISTED" AND oracle_builds = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "uncached plan agrees after local repair" '
+CALL sync.plan_disambiguate_uncached(
+  "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
+YIELD status, outcome, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND word = ["to_corridor"] AND generation = 3
+                 AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+expect_failure "invalid incremental batch rolls back" '
+CALL sync.update_cells("warehouse", [
+  {
+    state_key: "east_bay:west",
+    action_key: "to_wall",
+    output_key: "symmetric"
+  },
+  {
+    state_key: "west_bay:east",
+    action_key: "to_wall",
+    target_key: "missing"
+  }
+], 15)
+YIELD status RETURN status;'
+
+assert_pass "invalid batch leaves base view and metadata unchanged" '
+MATCH (m:SyncModel {model: "warehouse"})
+MATCH (:SyncState {model: "warehouse", state_key: "east_bay:west"})
+      -[:SYNC_OBS {model: "warehouse", action_key: "to_wall"}]->
+      (o:SyncOutput)
+RETURN CASE WHEN m.generation = 3 AND m.prepared_generation = 3
+                 AND m.oracle_epoch = 3 AND NOT m.dirty
+                 AND o.output_key = "east_landmark"
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "bounded repair falls back to rebuild" '
+CALL sync.update_cells("warehouse", [{
+  state_key: "east_bay:west",
+  action_key: "to_wall",
+  output_key: "symmetric"
+}], 1)
+YIELD status, generation, oracle_epoch, changed_cells, direct_pair_edges,
+      pair_records_touched, fallback_rebuild
+RETURN CASE WHEN status = "UPDATED" AND generation = 4 AND oracle_epoch = 3
+                 AND changed_cells = 1 AND direct_pair_edges = 5
+                 AND pair_records_touched = 15 AND fallback_rebuild
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "cached plan after fallback rebuild" '
+CALL sync.plan_sync(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND word = ["to_corridor", "go_west"] AND generation = 4
+                 AND oracle_source = "PERSISTED" AND oracle_builds = 0
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "uncached plan agrees after fallback rebuild" '
+CALL sync.plan_sync_uncached(
+  "warehouse", ["west_bay:east", "east_bay:west"], 64)
+YIELD status, outcome, word, generation, oracle_source, oracle_builds
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND word = ["to_corridor", "go_west"] AND generation = 4
+                 AND oracle_source = "RECOMPUTED" AND oracle_builds = 1
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
+assert_pass "pre-update plan generation is stale" '
+CALL sync.validate_update(
+  "warehouse", 3,
+  ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 1, [], false)
+YIELD status, decision, generation
+RETURN CASE WHEN status = "OK" AND decision = "STALE_GENERATION"
+                 AND generation = 4
             THEN "PASS" ELSE "FAIL" END AS result;'
 
 echo "Memgraph integration test passed"

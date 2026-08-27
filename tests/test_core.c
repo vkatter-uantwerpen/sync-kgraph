@@ -1,5 +1,7 @@
 #include "sync_kgraph/sync.h"
 
+#include "dynamic.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +13,16 @@
       exit(EXIT_FAILURE);                                                                          \
     }                                                                                              \
   } while (0)
+
+enum {
+  NUMERIC_STATE_COUNT = 6,
+  NUMERIC_ACTION_COUNT = 3,
+  NUMERIC_OUTPUT_COUNT = 2,
+  NUMERIC_CELL_COUNT = NUMERIC_STATE_COUNT * NUMERIC_ACTION_COUNT,
+  NUMERIC_MUTATION_COUNT = 48,
+  NUMERIC_MUTATION_STRIDE = 5,
+  NUMERIC_ACTION_STRIDE = 7,
+};
 
 typedef struct {
   const char *source;
@@ -25,6 +37,102 @@ typedef struct {
   size_t action_rows;
   size_t singleton_rows;
 } explain_counts;
+
+typedef struct {
+  size_t state_count;
+  size_t action_count;
+  size_t pair_count;
+  size_t *first_states;
+  size_t *second_states;
+  sg_pair_record *records;
+  sg_pair_arc *arcs;
+  size_t record_reads;
+} memory_pair_store;
+
+static sg_status memory_read_records(void *context, const size_t *pair_ids, size_t pair_count,
+                                     sg_pair_record *records) {
+  memory_pair_store *store = context;
+  ++store->record_reads;
+  for (size_t index = 0U; index < pair_count; ++index) {
+    if (pair_ids[index] >= store->pair_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+    records[index] = store->records[pair_ids[index]];
+  }
+  return SG_OK;
+}
+
+static sg_status memory_read_outgoing(void *context, const size_t *source_pairs,
+                                      size_t source_count, sg_pair_arc_batch *batch) {
+  memory_pair_store *store = context;
+  batch->count = source_count * store->action_count;
+  batch->items = calloc(batch->count == 0U ? 1U : batch->count, sizeof(*batch->items));
+  if (batch->items == NULL) {
+    return SG_ERR_ALLOC;
+  }
+  size_t position = 0U;
+  for (size_t source = 0U; source < source_count; ++source) {
+    if (source_pairs[source] >= store->pair_count) {
+      free(batch->items);
+      *batch = (sg_pair_arc_batch){0};
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+    for (size_t action = 0U; action < store->action_count; ++action) {
+      batch->items[position] = store->arcs[(source_pairs[source] * store->action_count) + action];
+      ++position;
+    }
+  }
+  return SG_OK;
+}
+
+static sg_status memory_read_incoming(void *context, const size_t *target_pairs,
+                                      size_t target_count, sg_pair_arc_batch *batch) {
+  memory_pair_store *store = context;
+  bool *targets = calloc(store->pair_count, sizeof(*targets));
+  if (targets == NULL) {
+    return SG_ERR_ALLOC;
+  }
+  for (size_t index = 0U; index < target_count; ++index) {
+    if (target_pairs[index] >= store->pair_count) {
+      free(targets);
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+    targets[target_pairs[index]] = true;
+  }
+  size_t count = 0U;
+  for (size_t edge = 0U; edge < store->pair_count * store->action_count; ++edge) {
+    if (targets[store->arcs[edge].target_pair]) {
+      ++count;
+    }
+  }
+  batch->items = calloc(count == 0U ? 1U : count, sizeof(*batch->items));
+  if (batch->items == NULL) {
+    free(targets);
+    return SG_ERR_ALLOC;
+  }
+  batch->count = count;
+  size_t position = 0U;
+  for (size_t edge = 0U; edge < store->pair_count * store->action_count; ++edge) {
+    if (targets[store->arcs[edge].target_pair]) {
+      batch->items[position] = store->arcs[edge];
+      ++position;
+    }
+  }
+  free(targets);
+  return SG_OK;
+}
+
+static sg_status memory_write_records(void *context, const sg_pair_record *records,
+                                      size_t record_count) {
+  memory_pair_store *store = context;
+  for (size_t index = 0U; index < record_count; ++index) {
+    if (records[index].pair >= store->pair_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+    store->records[records[index].pair] = records[index];
+  }
+  return SG_OK;
+}
 
 static void add_keys(sg_automaton_builder *builder, const char *const *states, size_t state_count,
                      const char *const *actions, size_t action_count, const char *const *outputs,
@@ -119,6 +227,80 @@ static sg_automaton *build_two_step_observer(void) {
   return automaton;
 }
 
+static sg_automaton *build_numeric_automaton(const size_t *transitions, const size_t *observations,
+                                             uint64_t generation) {
+  static const char *const states[] = {"q0", "q1", "q2", "q3", "q4", "q5"};
+  static const char *const actions[] = {"a0", "a1", "a2"};
+  static const char *const outputs[] = {"o0", "o1"};
+  sg_automaton_builder *builder = NULL;
+  CHECK(sg_automaton_builder_init(&builder) == SG_OK);
+  add_keys(builder, states, NUMERIC_STATE_COUNT, actions, NUMERIC_ACTION_COUNT, outputs,
+           NUMERIC_OUTPUT_COUNT);
+  for (size_t state = 0U; state < NUMERIC_STATE_COUNT; ++state) {
+    for (size_t action = 0U; action < NUMERIC_ACTION_COUNT; ++action) {
+      const size_t cell = (state * NUMERIC_ACTION_COUNT) + action;
+      CHECK(transitions[cell] < NUMERIC_STATE_COUNT);
+      CHECK(observations[cell] < NUMERIC_OUTPUT_COUNT);
+      CHECK(sg_automaton_builder_add_transition(builder, states[state], actions[action],
+                                                states[transitions[cell]]) == SG_OK);
+      CHECK(sg_automaton_builder_add_observation(builder, states[state], actions[action],
+                                                 outputs[observations[cell]]) == SG_OK);
+    }
+  }
+  sg_automaton *automaton = NULL;
+  CHECK(sg_automaton_builder_build(builder, generation, &automaton) == SG_OK);
+  sg_automaton_builder_free(builder);
+  return automaton;
+}
+
+static void memory_store_init(const sg_pair_oracle *oracle, memory_pair_store *store) {
+  store->state_count = NUMERIC_STATE_COUNT;
+  store->action_count = NUMERIC_ACTION_COUNT;
+  store->pair_count = sg_pair_oracle_pair_count(oracle);
+  store->first_states = calloc(store->pair_count, sizeof(*store->first_states));
+  store->second_states = calloc(store->pair_count, sizeof(*store->second_states));
+  store->records = calloc(store->pair_count, sizeof(*store->records));
+  store->arcs = calloc(store->pair_count * store->action_count, sizeof(*store->arcs));
+  CHECK(store->first_states != NULL);
+  CHECK(store->second_states != NULL);
+  CHECK(store->records != NULL);
+  CHECK(store->arcs != NULL);
+  for (size_t pair = 0U; pair < store->pair_count; ++pair) {
+    CHECK(sg_pair_oracle_pair_states(oracle, pair, &store->first_states[pair],
+                                     &store->second_states[pair]) == SG_OK);
+    CHECK(sg_pair_oracle_record(oracle, pair, &store->records[pair]) == SG_OK);
+    for (size_t action = 0U; action < store->action_count; ++action) {
+      const size_t edge = (pair * store->action_count) + action;
+      store->arcs[edge].source_pair = pair;
+      store->arcs[edge].action = action;
+      CHECK(sg_pair_oracle_pair_step(oracle, pair, action, &store->arcs[edge].target_pair,
+                                     &store->arcs[edge].outputs_differ) == SG_OK);
+    }
+  }
+}
+
+static void memory_store_free(memory_pair_store *store) {
+  free(store->first_states);
+  free(store->second_states);
+  free(store->records);
+  free(store->arcs);
+  *store = (memory_pair_store){0};
+}
+
+static void check_pair_records_equal(const sg_pair_record *first, const sg_pair_record *second) {
+  CHECK(first->pair == second->pair);
+  CHECK(first->mergeable == second->mergeable);
+  CHECK(first->merge_distance == second->merge_distance);
+  CHECK(first->merge_action == second->merge_action);
+  CHECK(first->merge_next_pair == second->merge_next_pair);
+  CHECK(first->merge_support_count == second->merge_support_count);
+  CHECK(first->resolvable == second->resolvable);
+  CHECK(first->resolution_distance == second->resolution_distance);
+  CHECK(first->resolution_action == second->resolution_action);
+  CHECK(first->resolution_next_pair == second->resolution_next_pair);
+  CHECK(first->resolution_support_count == second->resolution_support_count);
+}
+
 static size_t state_id(const sg_automaton *automaton, const char *key) {
   size_t state = SG_INDEX_NONE;
   CHECK(sg_automaton_find_state(automaton, key, &state) == SG_OK);
@@ -129,6 +311,36 @@ static size_t action_id(const sg_automaton *automaton, const char *key) {
   size_t action = SG_INDEX_NONE;
   CHECK(sg_automaton_find_action(automaton, key, &action) == SG_OK);
   return action;
+}
+
+static sg_pair_oracle *restore_oracle(const sg_automaton *automaton, const sg_pair_oracle *source) {
+  const size_t pair_count = sg_pair_oracle_pair_count(source);
+  sg_pair_record *records = calloc(pair_count, sizeof(*records));
+  CHECK(records != NULL);
+  for (size_t pair = 0U; pair < pair_count; ++pair) {
+    CHECK(sg_pair_oracle_record(source, pair, &records[pair]) == SG_OK);
+  }
+  sg_pair_oracle *restored = NULL;
+  CHECK(sg_pair_oracle_restore(automaton, records, pair_count, &restored) == SG_OK);
+  free(records);
+  return restored;
+}
+
+static void check_plan_semantics_equal(const sg_plan_result *first, const sg_plan_result *second) {
+  CHECK(first->outcome == second->outcome);
+  CHECK(first->method == second->method);
+  CHECK(first->word.length == second->word.length);
+  for (size_t index = 0U; index < first->word.length; ++index) {
+    CHECK(first->word.actions[index] == second->word.actions[index]);
+  }
+  CHECK(first->final_state == second->final_state);
+  CHECK(first->final_support_size == second->final_support_size);
+  CHECK(first->best_support_size == second->best_support_size);
+  CHECK(first->worst_support_size == second->worst_support_size);
+  CHECK(first->branch_count == second->branch_count);
+  CHECK(first->expansions == second->expansions);
+  CHECK(first->homing == second->homing);
+  CHECK(first->generation == second->generation);
 }
 
 static sg_status count_explanation(void *context, size_t step, size_t action,
@@ -358,10 +570,176 @@ static void test_exact_partition_search(void) {
   sg_automaton_free(automaton);
 }
 
+static void test_oracle_source_equivalence(void) {
+  sg_automaton *warehouse = build_warehouse();
+  sg_pair_oracle *built = NULL;
+  CHECK(sg_pair_oracle_build(warehouse, &built) == SG_OK);
+  sg_pair_oracle *restored = restore_oracle(warehouse, built);
+  const size_t ambiguous[] = {
+      state_id(warehouse, "west_bay:east"),
+      state_id(warehouse, "east_bay:west"),
+  };
+  const size_t singleton[] = {state_id(warehouse, "dock:north")};
+  sg_plan_result first = {0};
+  sg_plan_result second = {0};
+
+  CHECK(sg_plan_sync(warehouse, built, ambiguous, 2U, 16U, &first) == SG_OK);
+  CHECK(sg_plan_sync(warehouse, restored, ambiguous, 2U, 16U, &second) == SG_OK);
+  check_plan_semantics_equal(&first, &second);
+  sg_plan_result_free(&first);
+  sg_plan_result_free(&second);
+
+  CHECK(sg_plan_disambiguate(warehouse, built, ambiguous, 2U, 1U, 16U, &first) == SG_OK);
+  CHECK(sg_plan_disambiguate(warehouse, restored, ambiguous, 2U, 1U, 16U, &second) == SG_OK);
+  check_plan_semantics_equal(&first, &second);
+  sg_plan_result_free(&first);
+  sg_plan_result_free(&second);
+
+  CHECK(sg_plan_sync(warehouse, built, singleton, 1U, 16U, &first) == SG_OK);
+  CHECK(sg_plan_sync(warehouse, restored, singleton, 1U, 16U, &second) == SG_OK);
+  check_plan_semantics_equal(&first, &second);
+  CHECK(first.outcome == SG_OUTCOME_ALREADY_SATISFIED);
+  sg_plan_result_free(&first);
+  sg_plan_result_free(&second);
+
+  sg_pair_oracle_free(restored);
+  sg_pair_oracle_free(built);
+  sg_automaton_free(warehouse);
+
+  sg_automaton *observer = build_two_step_observer();
+  CHECK(sg_pair_oracle_build(observer, &built) == SG_OK);
+  restored = restore_oracle(observer, built);
+  const size_t observer_initial[] = {
+      state_id(observer, "A"),
+      state_id(observer, "B"),
+      state_id(observer, "C"),
+  };
+
+  CHECK(sg_plan_disambiguate(observer, built, observer_initial, 3U, 1U, 1U, &first) == SG_OK);
+  CHECK(sg_plan_disambiguate(observer, restored, observer_initial, 3U, 1U, 1U, &second) == SG_OK);
+  check_plan_semantics_equal(&first, &second);
+  CHECK(first.outcome == SG_OUTCOME_RESOURCE_BOUND);
+  sg_plan_result_free(&first);
+  sg_plan_result_free(&second);
+
+  CHECK(sg_plan_disambiguate(observer, built, observer_initial, 3U, 1U, 16U, &first) == SG_OK);
+  CHECK(sg_plan_disambiguate(observer, restored, observer_initial, 3U, 1U, 16U, &second) == SG_OK);
+  check_plan_semantics_equal(&first, &second);
+  CHECK(first.method == SG_METHOD_PARTITION_BFS);
+  sg_plan_result_free(&first);
+  sg_plan_result_free(&second);
+
+  CHECK(sg_plan_sync(observer, built, observer_initial, 3U, 16U, &first) == SG_OK);
+  CHECK(sg_plan_sync(observer, restored, observer_initial, 3U, 16U, &second) == SG_OK);
+  check_plan_semantics_equal(&first, &second);
+  CHECK(first.outcome == SG_OUTCOME_NO_PLAN);
+  sg_plan_result_free(&first);
+  sg_plan_result_free(&second);
+
+  sg_pair_oracle_free(restored);
+  sg_pair_oracle_free(built);
+  sg_automaton_free(observer);
+}
+
+static void test_incremental_pair_maintenance(void) {
+  size_t transitions[NUMERIC_CELL_COUNT] = {0};
+  size_t observations[NUMERIC_CELL_COUNT] = {0};
+  for (size_t state = 0U; state < NUMERIC_STATE_COUNT; ++state) {
+    for (size_t action = 0U; action < NUMERIC_ACTION_COUNT; ++action) {
+      const size_t cell = (state * NUMERIC_ACTION_COUNT) + action;
+      transitions[cell] = (state + action + 1U) % NUMERIC_STATE_COUNT;
+      observations[cell] = (state + action) % NUMERIC_OUTPUT_COUNT;
+    }
+  }
+  sg_automaton *automaton = build_numeric_automaton(transitions, observations, UINT64_C(1));
+  sg_pair_oracle *oracle = NULL;
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  memory_pair_store memory = {0};
+  memory_store_init(oracle, &memory);
+  sg_pair_store store = {
+      .context = &memory,
+      .state_count = memory.state_count,
+      .action_count = memory.action_count,
+      .pair_count = memory.pair_count,
+      .read_records = memory_read_records,
+      .read_outgoing = memory_read_outgoing,
+      .read_incoming = memory_read_incoming,
+      .write_records = memory_write_records,
+  };
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+
+  for (size_t step = 0U; step < NUMERIC_MUTATION_COUNT; ++step) {
+    const size_t state = ((step * NUMERIC_MUTATION_STRIDE) + 1U) % NUMERIC_STATE_COUNT;
+    const size_t action = ((step * NUMERIC_ACTION_STRIDE) + 2U) % NUMERIC_ACTION_COUNT;
+    const size_t cell = (state * NUMERIC_ACTION_COUNT) + action;
+    if (step % NUMERIC_ACTION_COUNT != 0U) {
+      transitions[cell] =
+          (transitions[cell] + 1U + (step % NUMERIC_MUTATION_STRIDE)) % NUMERIC_STATE_COUNT;
+    }
+    if (step % NUMERIC_ACTION_COUNT != 1U) {
+      observations[cell] ^= 1U;
+    }
+    automaton = build_numeric_automaton(transitions, observations, (uint64_t)step + UINT64_C(2));
+    CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+    size_t seeds[NUMERIC_STATE_COUNT] = {0};
+    size_t seed_count = 0U;
+    for (size_t pair = 0U; pair < memory.pair_count; ++pair) {
+      if (memory.first_states[pair] == state || memory.second_states[pair] == state) {
+        seeds[seed_count] = pair;
+        ++seed_count;
+        const size_t edge = (pair * memory.action_count) + action;
+        CHECK(sg_pair_oracle_pair_step(oracle, pair, action, &memory.arcs[edge].target_pair,
+                                       &memory.arcs[edge].outputs_differ) == SG_OK);
+      }
+    }
+    CHECK(seed_count == NUMERIC_STATE_COUNT);
+    sg_pair_repair_metrics metrics = {0};
+    CHECK(sg_pair_store_repair(&store, seeds, seed_count, memory.pair_count, &metrics) == SG_OK);
+    CHECK(metrics.pair_records_touched >= seed_count);
+    CHECK(metrics.pair_records_touched <= memory.pair_count);
+    for (size_t pair = 0U; pair < memory.pair_count; ++pair) {
+      sg_pair_record expected = {0};
+      CHECK(sg_pair_oracle_record(oracle, pair, &expected) == SG_OK);
+      check_pair_records_equal(&memory.records[pair], &expected);
+    }
+    sg_pair_oracle_free(oracle);
+    sg_automaton_free(automaton);
+  }
+
+  automaton = build_numeric_automaton(transitions, observations, UINT64_C(50));
+  CHECK(sg_pair_oracle_build(automaton, &oracle) == SG_OK);
+  const sg_pair_record_source source = {
+      .context = &memory,
+      .read = memory_read_records,
+  };
+  const size_t hypotheses[] = {0U, 1U, 2U, 3U};
+  sg_plan_result expected_plan = {0};
+  sg_plan_result actual_plan = {0};
+  CHECK(sg_plan_sync(automaton, oracle, hypotheses, 4U, 64U, &expected_plan) == SG_OK);
+  CHECK(sg_plan_sync_from_records(automaton, &source, hypotheses, 4U, 64U, &actual_plan) == SG_OK);
+  check_plan_semantics_equal(&expected_plan, &actual_plan);
+  sg_plan_result_free(&expected_plan);
+  sg_plan_result_free(&actual_plan);
+  CHECK(sg_plan_disambiguate(automaton, oracle, hypotheses, 4U, 1U, 64U, &expected_plan) == SG_OK);
+  CHECK(sg_plan_disambiguate_from_records(automaton, &source, hypotheses, 4U, 1U, 64U,
+                                          &actual_plan) == SG_OK);
+  check_plan_semantics_equal(&expected_plan, &actual_plan);
+  sg_plan_result_free(&expected_plan);
+  sg_plan_result_free(&actual_plan);
+  CHECK(memory.record_reads != 0U);
+
+  sg_pair_oracle_free(oracle);
+  sg_automaton_free(automaton);
+  memory_store_free(&memory);
+}
+
 int main(void) {
   test_names_and_builder_validation();
   test_automaton_and_oracle();
   test_planners_explanation_and_monitor();
   test_exact_partition_search();
+  test_oracle_source_equivalence();
+  test_incremental_pair_maintenance();
   return EXIT_SUCCESS;
 }

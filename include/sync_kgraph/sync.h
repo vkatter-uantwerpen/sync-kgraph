@@ -77,11 +77,21 @@ typedef struct {
   size_t merge_distance;
   size_t merge_action;
   size_t merge_next_pair;
+  size_t merge_support_count;
   bool resolvable;
   size_t resolution_distance;
   size_t resolution_action;
   size_t resolution_next_pair;
+  size_t resolution_support_count;
 } sg_pair_record;
+
+typedef sg_status (*sg_pair_record_reader)(void *context, const size_t *pair_ids, size_t pair_count,
+                                           sg_pair_record *records);
+
+typedef struct {
+  void *context;
+  sg_pair_record_reader read;
+} sg_pair_record_source;
 
 typedef struct {
   sg_monitor_decision decision;
@@ -158,9 +168,17 @@ sg_status sg_pair_oracle_resolution_word(const sg_pair_oracle *oracle, size_t fi
 sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
                        const size_t *initial_states, size_t initial_count, size_t budget,
                        sg_plan_result *result);
+sg_status sg_plan_sync_from_records(const sg_automaton *automaton,
+                                    const sg_pair_record_source *source,
+                                    const size_t *initial_states, size_t initial_count,
+                                    size_t budget, sg_plan_result *result);
 sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_oracle *oracle,
                                const size_t *initial_states, size_t initial_count, size_t bound,
                                size_t budget, sg_plan_result *result);
+sg_status sg_plan_disambiguate_from_records(const sg_automaton *automaton,
+                                            const sg_pair_record_source *source,
+                                            const size_t *initial_states, size_t initial_count,
+                                            size_t bound, size_t budget, sg_plan_result *result);
 void sg_plan_result_free(sg_plan_result *result);
 
 sg_status sg_apply_word(const sg_automaton *automaton, const size_t *initial_states,

@@ -1,7 +1,7 @@
 project(
   'sync-kgraph',
   'c',
-  version: '0.2.0',
+  version: '0.3.0',
   default_options: [
     # c2x, not c23: meson only learned 'c23' in 1.4, and this project declares
     # meson_version >=1.3.0. Newer meson still accepts c2x, and both select the
@@ -36,6 +36,7 @@ endforeach
 inc = include_directories('include')
 
 sync_sources = files(
+  'src/dynamic.c',
   'src/oracle.c',
   'src/planner.c',
   'src/sync.c',
@@ -66,6 +67,7 @@ test_core = executable(
   'test_core',
   'tests/test_core.c',
   dependencies: sync_dep,
+  include_directories: include_directories('src'),
 )
 
 test('core', test_core)
@@ -122,6 +124,7 @@ if has_memgraph and not memgraph_feature.disabled()
     'sync',
     'src/memgraph/sync_module.c',
     dependencies: sync_dep,
+    include_directories: include_directories('src'),
     c_args: memgraph_args,
     name_prefix: '',
     link_args: module_link_args,
