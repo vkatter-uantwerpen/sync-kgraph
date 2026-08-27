@@ -29,9 +29,11 @@ struct sg_pair_oracle {
   size_t *merge_distance;
   size_t *merge_action;
   size_t *merge_next;
+  size_t *merge_support_count;
   size_t *resolution_distance;
   size_t *resolution_action;
   size_t *resolution_next;
+  size_t *resolution_support_count;
 };
 
 bool sg_size_multiply(size_t first, size_t second, size_t *product);
@@ -39,5 +41,9 @@ char *sg_string_duplicate(const char *value);
 sg_status sg_word_extend(sg_word *destination, const sg_word *source);
 size_t sg_pair_index(size_t state_count, size_t first, size_t second);
 uint64_t sg_monotonic_time_us(void);
+sg_status sg_automaton_clone_generation(const sg_automaton *source, uint64_t generation,
+                                        sg_automaton **clone);
+sg_status sg_automaton_set_cell(sg_automaton *automaton, size_t state, size_t action, size_t target,
+                                size_t output);
 
 #endif

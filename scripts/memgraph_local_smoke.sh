@@ -4,8 +4,14 @@ set -eu
 builddir="${1:-build-memgraph-local}"
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 case "$builddir" in
-/*) module="$builddir/sync.so" ;;
-*) module="$root/$builddir/sync.so" ;;
+/*)
+  module="$builddir/sync.so"
+  ablation_report="$builddir/ablation.csv"
+  ;;
+*)
+  module="$root/$builddir/sync.so"
+  ablation_report="$root/$builddir/ablation.csv"
+  ;;
 esac
 memgraph="${MEMGRAPH_BINARY:-/usr/lib/memgraph/memgraph}"
 port="${MEMGRAPH_TEST_PORT:-$((17687 + ($$ % 10000)))}"
@@ -85,7 +91,16 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
+mgconsole \
+  --host=127.0.0.1 \
+  --port="$port" \
+  --no_history <"$root/cypher/install_schema.cypher" >/dev/null
+
 MEMGRAPH_HOST=127.0.0.1 MEMGRAPH_PORT="$port" \
   sh "$root/scripts/memgraph_integration.sh" local
+if [ "${SYNC_KGRAPH_RUN_ABLATION:-1}" = "1" ]; then
+  MEMGRAPH_HOST=127.0.0.1 MEMGRAPH_PORT="$port" \
+    sh "$root/scripts/memgraph_ablation.sh" "$ablation_report" local
+fi
 
 echo "Local smoke used isolated temporary data and left the installed database untouched"

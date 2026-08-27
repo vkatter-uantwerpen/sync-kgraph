@@ -1,7 +1,7 @@
 project(
   'sync-kgraph',
   'c',
-  version: '0.2.0',
+  version: '0.4.0',
   default_options: [
     # c2x, not c23: meson only learned 'c23' in 1.4, and this project declares
     # meson_version >=1.3.0. Newer meson still accepts c2x, and both select the
@@ -15,6 +15,7 @@ project(
 )
 
 cc = meson.get_compiler('c')
+threads = dependency('threads')
 
 common_args = [
   '-D_POSIX_C_SOURCE=200809L',
@@ -36,8 +37,11 @@ endforeach
 inc = include_directories('include')
 
 sync_sources = files(
+  'src/dynamic.c',
   'src/oracle.c',
   'src/planner.c',
+  'src/snapshot.c',
+  'src/snapshot_cache.c',
   'src/sync.c',
 )
 
@@ -45,12 +49,14 @@ sync_lib = static_library(
   'sync_kgraph',
   sync_sources,
   include_directories: inc,
+  dependencies: threads,
   install: true,
 )
 
 sync_dep = declare_dependency(
   include_directories: inc,
   link_with: sync_lib,
+  dependencies: threads,
 )
 
 install_headers('include/sync_kgraph/sync.h', subdir: 'sync_kgraph')
@@ -66,9 +72,17 @@ test_core = executable(
   'test_core',
   'tests/test_core.c',
   dependencies: sync_dep,
+  include_directories: include_directories('src'),
 )
 
 test('core', test_core)
+
+ablation_benchmark = executable(
+  'ablation_benchmark',
+  'tests/ablation_benchmark.c',
+  dependencies: sync_dep,
+  include_directories: include_directories('src'),
+)
 
 valgrind = find_program('valgrind', required: false)
 if valgrind.found()
@@ -122,6 +136,7 @@ if has_memgraph and not memgraph_feature.disabled()
     'sync',
     'src/memgraph/sync_module.c',
     dependencies: sync_dep,
+    include_directories: include_directories('src'),
     c_args: memgraph_args,
     name_prefix: '',
     link_args: module_link_args,

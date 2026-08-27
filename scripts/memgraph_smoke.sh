@@ -60,4 +60,12 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
+docker exec -i "$container" mgconsole \
+  --host=127.0.0.1 \
+  --port=7687 \
+  --no_history <"$root/cypher/install_schema.cypher" >/dev/null
+
 sh "$root/scripts/memgraph_integration.sh" docker "$container"
+if [ "${SYNC_KGRAPH_RUN_ABLATION:-1}" = "1" ]; then
+  sh "$root/scripts/memgraph_ablation.sh" "$absolute_builddir/ablation.csv" docker "$container"
+fi

@@ -8,10 +8,10 @@ if [ -n "$memgraph_include_dir" ]; then
   CC="${CC:-clang}" meson setup "$builddir" --wipe \
     -Dmemgraph=enabled \
     -Dmemgraph_include_dir="$memgraph_include_dir"
-  tidy_files="src/oracle.c src/planner.c src/sync.c src/sync_cli.c src/memgraph/sync_module.c tests/test_core.c"
+  tidy_files="src/dynamic.c src/oracle.c src/planner.c src/snapshot.c src/snapshot_cache.c src/sync.c src/sync_cli.c src/memgraph/sync_module.c tests/ablation_benchmark.c tests/test_core.c"
 else
   CC="${CC:-clang}" meson setup "$builddir" --wipe -Dmemgraph=disabled
-  tidy_files="src/oracle.c src/planner.c src/sync.c src/sync_cli.c tests/test_core.c"
+  tidy_files="src/dynamic.c src/oracle.c src/planner.c src/snapshot.c src/snapshot_cache.c src/sync.c src/sync_cli.c tests/ablation_benchmark.c tests/test_core.c"
 fi
 
 ninja -C "$builddir"

@@ -64,14 +64,18 @@ static sg_status sg_oracle_allocate(const sg_automaton *automaton, sg_pair_oracl
   created->merge_distance = calloc(pair_count, sizeof(*created->merge_distance));
   created->merge_action = calloc(pair_count, sizeof(*created->merge_action));
   created->merge_next = calloc(pair_count, sizeof(*created->merge_next));
+  created->merge_support_count = calloc(pair_count, sizeof(*created->merge_support_count));
   created->resolution_distance = calloc(pair_count, sizeof(*created->resolution_distance));
   created->resolution_action = calloc(pair_count, sizeof(*created->resolution_action));
   created->resolution_next = calloc(pair_count, sizeof(*created->resolution_next));
+  created->resolution_support_count =
+      calloc(pair_count, sizeof(*created->resolution_support_count));
   if (created->first == NULL || created->second == NULL || created->next == NULL ||
       created->outputs_differ == NULL || created->merge_distance == NULL ||
       created->merge_action == NULL || created->merge_next == NULL ||
-      created->resolution_distance == NULL || created->resolution_action == NULL ||
-      created->resolution_next == NULL) {
+      created->merge_support_count == NULL || created->resolution_distance == NULL ||
+      created->resolution_action == NULL || created->resolution_next == NULL ||
+      created->resolution_support_count == NULL) {
     sg_pair_oracle_free(created);
     return SG_ERR_ALLOC;
   }
@@ -234,9 +238,11 @@ static void sg_choose_witnesses(sg_pair_oracle *oracle) {
         const size_t next = oracle->next[(pair * actions) + action];
         if (oracle->merge_distance[next] != SG_INDEX_NONE &&
             oracle->merge_distance[next] + 1U == oracle->merge_distance[pair]) {
-          oracle->merge_action[pair] = action;
-          oracle->merge_next[pair] = next;
-          break;
+          if (oracle->merge_support_count[pair] == 0U) {
+            oracle->merge_action[pair] = action;
+            oracle->merge_next[pair] = next;
+          }
+          ++oracle->merge_support_count[pair];
         }
       }
     }
@@ -246,17 +252,18 @@ static void sg_choose_witnesses(sg_pair_oracle *oracle) {
     }
     for (size_t action = 0U; action < actions; ++action) {
       const size_t edge = (pair * actions) + action;
-      if (oracle->resolution_distance[pair] == 1U && oracle->outputs_differ[edge]) {
-        oracle->resolution_action[pair] = action;
-        oracle->resolution_next[pair] = SG_INDEX_NONE;
-        break;
-      }
       const size_t next = oracle->next[edge];
-      if (!oracle->outputs_differ[edge] && oracle->resolution_distance[next] != SG_INDEX_NONE &&
-          oracle->resolution_distance[next] + 1U == oracle->resolution_distance[pair]) {
-        oracle->resolution_action[pair] = action;
-        oracle->resolution_next[pair] = next;
-        break;
+      const bool immediate =
+          oracle->resolution_distance[pair] == 1U && oracle->outputs_differ[edge];
+      const bool via_next =
+          !oracle->outputs_differ[edge] && oracle->resolution_distance[next] != SG_INDEX_NONE &&
+          oracle->resolution_distance[next] + 1U == oracle->resolution_distance[pair];
+      if (immediate || via_next) {
+        if (oracle->resolution_support_count[pair] == 0U) {
+          oracle->resolution_action[pair] = action;
+          oracle->resolution_next[pair] = immediate ? SG_INDEX_NONE : next;
+        }
+        ++oracle->resolution_support_count[pair];
       }
     }
   }
@@ -302,9 +309,11 @@ void sg_pair_oracle_free(sg_pair_oracle *oracle) {
   free(oracle->merge_distance);
   free(oracle->merge_action);
   free(oracle->merge_next);
+  free(oracle->merge_support_count);
   free(oracle->resolution_distance);
   free(oracle->resolution_action);
   free(oracle->resolution_next);
+  free(oracle->resolution_support_count);
   free(oracle);
 }
 
@@ -369,10 +378,12 @@ sg_status sg_pair_oracle_record(const sg_pair_oracle *oracle, size_t pair, sg_pa
       .merge_distance = oracle->merge_distance[pair],
       .merge_action = oracle->merge_action[pair],
       .merge_next_pair = oracle->merge_next[pair],
+      .merge_support_count = oracle->merge_support_count[pair],
       .resolvable = oracle->resolution_distance[pair] != SG_INDEX_NONE,
       .resolution_distance = oracle->resolution_distance[pair],
       .resolution_action = oracle->resolution_action[pair],
       .resolution_next_pair = oracle->resolution_next[pair],
+      .resolution_support_count = oracle->resolution_support_count[pair],
   };
   return SG_OK;
 }
@@ -380,33 +391,61 @@ sg_status sg_pair_oracle_record(const sg_pair_oracle *oracle, size_t pair, sg_pa
 static bool sg_merge_record_valid(const sg_pair_oracle *oracle, size_t pair) {
   const size_t distance = oracle->merge_distance[pair];
   if (distance == SG_INDEX_NONE) {
-    return oracle->merge_action[pair] == SG_INDEX_NONE && oracle->merge_next[pair] == SG_INDEX_NONE;
+    return oracle->merge_action[pair] == SG_INDEX_NONE &&
+           oracle->merge_next[pair] == SG_INDEX_NONE && oracle->merge_support_count[pair] == 0U;
   }
   if (distance == 0U) {
     return oracle->first[pair] == oracle->second[pair] &&
-           oracle->merge_action[pair] == SG_INDEX_NONE && oracle->merge_next[pair] == SG_INDEX_NONE;
+           oracle->merge_action[pair] == SG_INDEX_NONE &&
+           oracle->merge_next[pair] == SG_INDEX_NONE && oracle->merge_support_count[pair] == 0U;
   }
   const size_t action = oracle->merge_action[pair];
   const size_t next = oracle->merge_next[pair];
+  size_t support_count = 0U;
+  for (size_t candidate = 0U; candidate < oracle->automaton->action_count; ++candidate) {
+    const size_t candidate_next =
+        oracle->next[(pair * oracle->automaton->action_count) + candidate];
+    if (oracle->merge_distance[candidate_next] != SG_INDEX_NONE &&
+        oracle->merge_distance[candidate_next] + 1U == distance) {
+      ++support_count;
+    }
+  }
   return action < oracle->automaton->action_count && next < oracle->pair_count &&
          oracle->next[(pair * oracle->automaton->action_count) + action] == next &&
          oracle->merge_distance[next] != SG_INDEX_NONE &&
-         oracle->merge_distance[next] + 1U == distance;
+         oracle->merge_distance[next] + 1U == distance && support_count != 0U &&
+         oracle->merge_support_count[pair] == support_count;
 }
 
 static bool sg_resolution_record_valid(const sg_pair_oracle *oracle, size_t pair) {
   const size_t distance = oracle->resolution_distance[pair];
   if (distance == SG_INDEX_NONE) {
     return oracle->resolution_action[pair] == SG_INDEX_NONE &&
-           oracle->resolution_next[pair] == SG_INDEX_NONE;
+           oracle->resolution_next[pair] == SG_INDEX_NONE &&
+           oracle->resolution_support_count[pair] == 0U;
   }
   if (distance == 0U) {
     return oracle->first[pair] == oracle->second[pair] &&
            oracle->resolution_action[pair] == SG_INDEX_NONE &&
-           oracle->resolution_next[pair] == SG_INDEX_NONE;
+           oracle->resolution_next[pair] == SG_INDEX_NONE &&
+           oracle->resolution_support_count[pair] == 0U;
   }
   const size_t action = oracle->resolution_action[pair];
   if (action >= oracle->automaton->action_count) {
+    return false;
+  }
+  size_t support_count = 0U;
+  for (size_t candidate = 0U; candidate < oracle->automaton->action_count; ++candidate) {
+    const size_t candidate_edge = (pair * oracle->automaton->action_count) + candidate;
+    const size_t candidate_next = oracle->next[candidate_edge];
+    if ((distance == 1U && oracle->outputs_differ[candidate_edge]) ||
+        (!oracle->outputs_differ[candidate_edge] &&
+         oracle->resolution_distance[candidate_next] != SG_INDEX_NONE &&
+         oracle->resolution_distance[candidate_next] + 1U == distance)) {
+      ++support_count;
+    }
+  }
+  if (support_count == 0U || oracle->resolution_support_count[pair] != support_count) {
     return false;
   }
   const size_t edge = (pair * oracle->automaton->action_count) + action;
@@ -450,12 +489,14 @@ sg_status sg_pair_oracle_restore(const sg_automaton *automaton, const sg_pair_re
     created->merge_distance[record.pair] = record.mergeable ? record.merge_distance : SG_INDEX_NONE;
     created->merge_action[record.pair] = record.mergeable ? record.merge_action : SG_INDEX_NONE;
     created->merge_next[record.pair] = record.mergeable ? record.merge_next_pair : SG_INDEX_NONE;
+    created->merge_support_count[record.pair] = record.merge_support_count;
     created->resolution_distance[record.pair] =
         record.resolvable ? record.resolution_distance : SG_INDEX_NONE;
     created->resolution_action[record.pair] =
         record.resolvable ? record.resolution_action : SG_INDEX_NONE;
     created->resolution_next[record.pair] =
         record.resolvable ? record.resolution_next_pair : SG_INDEX_NONE;
+    created->resolution_support_count[record.pair] = record.resolution_support_count;
   }
   for (size_t pair = 0U; status == SG_OK && pair < created->pair_count; ++pair) {
     if (!seen[pair] || !sg_merge_record_valid(created, pair) ||
