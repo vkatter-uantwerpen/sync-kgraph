@@ -1,7 +1,7 @@
 project(
   'sync-kgraph',
   'c',
-  version: '0.3.0',
+  version: '0.4.0',
   default_options: [
     # c2x, not c23: meson only learned 'c23' in 1.4, and this project declares
     # meson_version >=1.3.0. Newer meson still accepts c2x, and both select the
