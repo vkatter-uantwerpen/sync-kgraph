@@ -41,6 +41,18 @@ typedef struct {
   size_t capacity;
 } sg_search_nodes;
 
+typedef struct {
+  sg_bitset support;
+  size_t parent;
+  size_t action;
+} sg_belief_node;
+
+typedef struct {
+  sg_belief_node *nodes;
+  size_t count;
+  size_t capacity;
+} sg_belief_search;
+
 static sg_status sg_bitset_init(sg_bitset *set, size_t state_count) {
   if (set == NULL || state_count == 0U) {
     return SG_ERR_INVALID_ARGUMENT;
@@ -263,8 +275,85 @@ static bool sg_sync_candidate_better(size_t count, size_t length, size_t pair, s
           (length < best_length || (length == best_length && pair < best_pair)));
 }
 
+static sg_status sg_allowed_merge_word(const sg_pair_oracle *oracle, size_t first, size_t second,
+                                       const size_t *allowed_actions, size_t allowed_action_count,
+                                       sg_word *word) {
+  sg_status status = sg_word_init(word);
+  if (status != SG_OK) {
+    return status;
+  }
+  const size_t root = sg_pair_index(oracle->automaton->state_count, first, second);
+  if (oracle->first[root] == oracle->second[root]) {
+    return SG_OK;
+  }
+  size_t allocation_size = 0U;
+  if (!sg_size_multiply(oracle->pair_count, sizeof(size_t), &allocation_size)) {
+    sg_word_free(word);
+    return SG_ERR_ALLOC;
+  }
+  size_t *parent = malloc(allocation_size);
+  size_t *parent_action = malloc(allocation_size);
+  size_t *queue = malloc(allocation_size);
+  if (parent == NULL || parent_action == NULL || queue == NULL) {
+    free(parent);
+    free(parent_action);
+    free(queue);
+    sg_word_free(word);
+    return SG_ERR_ALLOC;
+  }
+  for (size_t pair = 0U; pair < oracle->pair_count; ++pair) {
+    parent[pair] = SG_INDEX_NONE;
+    parent_action[pair] = SG_INDEX_NONE;
+  }
+  parent[root] = root;
+  queue[0] = root;
+  size_t head = 0U;
+  size_t tail = 1U;
+  size_t goal = SG_INDEX_NONE;
+  while (head < tail && goal == SG_INDEX_NONE) {
+    const size_t source = queue[head++];
+    for (size_t index = 0U; index < allowed_action_count; ++index) {
+      const size_t action = allowed_actions[index];
+      const size_t target = oracle->next[(source * oracle->automaton->action_count) + action];
+      if (parent[target] != SG_INDEX_NONE) {
+        continue;
+      }
+      parent[target] = source;
+      parent_action[target] = action;
+      queue[tail++] = target;
+      if (oracle->first[target] == oracle->second[target]) {
+        goal = target;
+        break;
+      }
+    }
+  }
+  if (goal == SG_INDEX_NONE) {
+    status = SG_ERR_NOT_FOUND;
+  } else {
+    size_t cursor = goal;
+    while (status == SG_OK && cursor != root) {
+      status = sg_word_append(word, parent_action[cursor]);
+      cursor = parent[cursor];
+    }
+    for (size_t left = 0U, right = word->length; left < right && right != 0U; ++left) {
+      --right;
+      const size_t temporary = word->actions[left];
+      word->actions[left] = word->actions[right];
+      word->actions[right] = temporary;
+    }
+  }
+  free(parent);
+  free(parent_action);
+  free(queue);
+  if (status != SG_OK) {
+    sg_word_free(word);
+  }
+  return status;
+}
+
 static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_oracle *oracle,
-                               const sg_bitset *active, sg_word *best_word,
+                               const sg_bitset *active, const size_t *allowed_actions,
+                               size_t allowed_action_count, sg_word *best_word,
                                sg_bitset *best_support) {
   size_t best_count = SG_INDEX_NONE;
   size_t best_length = SG_INDEX_NONE;
@@ -279,8 +368,13 @@ static sg_status sg_best_merge(const sg_automaton *automaton, const sg_pair_orac
         continue;
       }
       sg_word candidate_word = {0};
-      if (sg_pair_oracle_merge_word(oracle, first, second, &candidate_word) != SG_OK) {
+      const sg_status merge_status = sg_allowed_merge_word(oracle, first, second, allowed_actions,
+                                                           allowed_action_count, &candidate_word);
+      if (merge_status == SG_ERR_NOT_FOUND) {
         continue;
+      }
+      if (merge_status != SG_OK) {
+        return merge_status;
       }
       sg_bitset candidate_support = {0};
       status = sg_apply_word_set(automaton, active, &candidate_word, &candidate_support);
@@ -508,12 +602,19 @@ static sg_status sg_sync_finalize(const sg_automaton *automaton, const sg_bitset
   return status;
 }
 
-sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
-                       const size_t *initial_states, size_t initial_count, size_t budget,
-                       sg_plan_result *result) {
+sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                               const size_t *initial_states, size_t initial_count,
+                               const size_t *allowed_actions, size_t allowed_action_count,
+                               size_t budget, sg_plan_result *result) {
   if (automaton == NULL || oracle == NULL || oracle->automaton != automaton ||
-      initial_states == NULL || initial_count == 0U || budget == 0U || result == NULL) {
+      initial_states == NULL || initial_count == 0U || allowed_actions == NULL ||
+      allowed_action_count == 0U || budget == 0U || result == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
+  }
+  for (size_t index = 0U; index < allowed_action_count; ++index) {
+    if (allowed_actions[index] >= automaton->action_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
   }
   const uint64_t start = sg_monotonic_time_us();
   sg_status status = sg_plan_result_init(automaton, result);
@@ -543,7 +644,8 @@ sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *orac
     }
     sg_word witness = {0};
     sg_bitset next = {0};
-    status = sg_best_merge(automaton, oracle, &active, &witness, &next);
+    status = sg_best_merge(automaton, oracle, &active, allowed_actions, allowed_action_count,
+                           &witness, &next);
     if (status == SG_ERR_NOT_FOUND) {
       result->outcome = SG_OUTCOME_NO_PLAN;
       status = SG_OK;
@@ -570,6 +672,211 @@ sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *orac
   result->planning_time_us = sg_elapsed_us(start);
   sg_bitset_free(&initial);
   sg_bitset_free(&active);
+  if (status != SG_OK) {
+    sg_plan_result_free(result);
+  }
+  return status;
+}
+
+sg_status sg_plan_sync(const sg_automaton *automaton, const sg_pair_oracle *oracle,
+                       const size_t *initial_states, size_t initial_count, size_t budget,
+                       sg_plan_result *result) {
+  if (automaton == NULL) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  size_t *actions = malloc(automaton->action_count * sizeof(*actions));
+  if (actions == NULL) {
+    return SG_ERR_ALLOC;
+  }
+  for (size_t action = 0U; action < automaton->action_count; ++action) {
+    actions[action] = action;
+  }
+  const sg_status status = sg_plan_sync_allowed(automaton, oracle, initial_states, initial_count,
+                                                actions, automaton->action_count, budget, result);
+  free(actions);
+  return status;
+}
+
+static void sg_belief_search_free(sg_belief_search *search) {
+  if (search == NULL) {
+    return;
+  }
+  for (size_t index = 0U; index < search->count; ++index) {
+    sg_bitset_free(&search->nodes[index].support);
+  }
+  free(search->nodes);
+  search->nodes = NULL;
+  search->count = 0U;
+  search->capacity = 0U;
+}
+
+static size_t sg_belief_search_find(const sg_belief_search *search, const sg_bitset *support) {
+  for (size_t index = 0U; index < search->count; ++index) {
+    if (sg_bitset_equal(&search->nodes[index].support, support)) {
+      return index;
+    }
+  }
+  return SG_INDEX_NONE;
+}
+
+static sg_status sg_belief_search_add(sg_belief_search *search, sg_bitset *support, size_t parent,
+                                      size_t action, size_t *index) {
+  if (search->count == search->capacity) {
+    const size_t capacity = search->capacity == 0U ? 32U : search->capacity * 2U;
+    size_t bytes = 0U;
+    if (capacity < search->capacity ||
+        !sg_size_multiply(capacity, sizeof(*search->nodes), &bytes)) {
+      return SG_ERR_ALLOC;
+    }
+    sg_belief_node *nodes = realloc(search->nodes, bytes);
+    if (nodes == NULL) {
+      return SG_ERR_ALLOC;
+    }
+    search->nodes = nodes;
+    search->capacity = capacity;
+  }
+  *index = search->count;
+  search->nodes[search->count] = (sg_belief_node){
+      .support = *support,
+      .parent = parent,
+      .action = action,
+  };
+  support->words = NULL;
+  ++search->count;
+  return SG_OK;
+}
+
+static sg_status sg_belief_reconstruct(const sg_belief_search *search, size_t goal, sg_word *word) {
+  sg_status status = sg_word_init(word);
+  for (size_t cursor = goal; status == SG_OK && search->nodes[cursor].parent != SG_INDEX_NONE;
+       cursor = search->nodes[cursor].parent) {
+    status = sg_word_append(word, search->nodes[cursor].action);
+  }
+  for (size_t first = 0U, second = word->length; first < second && second != 0U; ++first) {
+    --second;
+    const size_t temporary = word->actions[first];
+    word->actions[first] = word->actions[second];
+    word->actions[second] = temporary;
+  }
+  if (status != SG_OK) {
+    sg_word_free(word);
+  }
+  return status;
+}
+
+static sg_status sg_goal_finalize(const sg_automaton *automaton, const sg_bitset *initial,
+                                  const sg_bitset *goals, sg_plan_result *result) {
+  sg_bitset final = {0};
+  sg_status status = sg_apply_word_set(automaton, initial, &result->word, &final);
+  if (status == SG_OK && !sg_bitset_subset(&final, goals)) {
+    status = SG_ERR_INVALID_MODEL;
+  }
+  if (status == SG_OK) {
+    result->final_support_size = sg_bitset_count(&final);
+    result->final_state = SG_INDEX_NONE;
+    if (result->final_support_size == 1U) {
+      size_t count = 0U;
+      sg_bitset_to_ids(&final, &result->final_state, &count);
+    }
+    status = sg_fill_plan_metrics(automaton, initial, result);
+  }
+  sg_bitset_free(&final);
+  return status;
+}
+
+sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_states,
+                       size_t initial_count, const size_t *goal_states, size_t goal_count,
+                       const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
+                       sg_plan_result *result) {
+  if (automaton == NULL || initial_states == NULL || initial_count == 0U || goal_states == NULL ||
+      goal_count == 0U || allowed_actions == NULL || allowed_action_count == 0U || budget == 0U ||
+      result == NULL) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  for (size_t index = 0U; index < allowed_action_count; ++index) {
+    if (allowed_actions[index] >= automaton->action_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+  }
+
+  const uint64_t start = sg_monotonic_time_us();
+  sg_status status = sg_plan_result_init(automaton, result);
+  sg_bitset initial = {0};
+  sg_bitset goals = {0};
+  if (status == SG_OK) {
+    status = sg_bitset_from_ids(automaton->state_count, initial_states, initial_count, &initial);
+  }
+  if (status == SG_OK) {
+    status = sg_bitset_from_ids(automaton->state_count, goal_states, goal_count, &goals);
+  }
+  if (status != SG_OK) {
+    sg_bitset_free(&initial);
+    sg_bitset_free(&goals);
+    sg_plan_result_free(result);
+    return status;
+  }
+
+  if (sg_bitset_subset(&initial, &goals)) {
+    result->outcome = SG_OUTCOME_ALREADY_SATISFIED;
+    result->method = SG_METHOD_BELIEF_BFS;
+    status = sg_goal_finalize(automaton, &initial, &goals, result);
+  } else {
+    sg_belief_search search = {0};
+    sg_bitset root = {0};
+    status = sg_bitset_copy(&initial, &root);
+    size_t root_index = 0U;
+    if (status == SG_OK) {
+      status = sg_belief_search_add(&search, &root, SG_INDEX_NONE, SG_INDEX_NONE, &root_index);
+    }
+    size_t head = 0U;
+    size_t found = SG_INDEX_NONE;
+    while (status == SG_OK && head < search.count && found == SG_INDEX_NONE) {
+      if (result->expansions >= budget) {
+        result->outcome = SG_OUTCOME_RESOURCE_BOUND;
+        break;
+      }
+      const size_t parent = head++;
+      ++result->expansions;
+      for (size_t letter = 0U; letter < allowed_action_count; ++letter) {
+        sg_bitset next = {0};
+        status = sg_bitset_init(&next, automaton->state_count);
+        if (status != SG_OK) {
+          break;
+        }
+        const size_t action = allowed_actions[letter];
+        sg_apply_action_set(automaton, &search.nodes[parent].support, action, &next);
+        if (sg_belief_search_find(&search, &next) != SG_INDEX_NONE) {
+          sg_bitset_free(&next);
+          continue;
+        }
+        size_t next_index = 0U;
+        status = sg_belief_search_add(&search, &next, parent, action, &next_index);
+        if (status != SG_OK) {
+          sg_bitset_free(&next);
+          break;
+        }
+        if (sg_bitset_subset(&search.nodes[next_index].support, &goals)) {
+          found = next_index;
+          break;
+        }
+      }
+    }
+    if (status == SG_OK && found != SG_INDEX_NONE) {
+      status = sg_belief_reconstruct(&search, found, &result->word);
+      if (status == SG_OK) {
+        result->outcome = SG_OUTCOME_PLAN;
+        result->method = SG_METHOD_BELIEF_BFS;
+        status = sg_goal_finalize(automaton, &initial, &goals, result);
+      }
+    } else if (status == SG_OK && result->outcome != SG_OUTCOME_RESOURCE_BOUND) {
+      result->outcome = SG_OUTCOME_NO_PLAN;
+    }
+    sg_bitset_free(&root);
+    sg_belief_search_free(&search);
+  }
+  result->planning_time_us = sg_elapsed_us(start);
+  sg_bitset_free(&initial);
+  sg_bitset_free(&goals);
   if (status != SG_OK) {
     sg_plan_result_free(result);
   }
@@ -851,8 +1158,9 @@ static sg_status sg_search_reconstruct(const sg_search_nodes *search, size_t goa
 }
 
 static sg_status sg_partition_bfs(const sg_automaton *automaton, const sg_bitset *initial,
-                                  size_t bound, size_t budget, size_t *expansions, sg_word *word,
-                                  sg_plan_outcome *outcome) {
+                                  size_t bound, const size_t *allowed_actions,
+                                  size_t allowed_action_count, size_t budget, size_t *expansions,
+                                  sg_word *word, sg_plan_outcome *outcome) {
   sg_search_nodes search = {0};
   sg_support_partition root = {0};
   sg_status status = sg_support_partition_init(initial, &root);
@@ -870,7 +1178,8 @@ static sg_status sg_partition_bfs(const sg_automaton *automaton, const sg_bitset
     const size_t parent = head;
     ++head;
     ++*expansions;
-    for (size_t action = 0U; action < automaton->action_count; ++action) {
+    for (size_t letter = 0U; letter < allowed_action_count; ++letter) {
+      const size_t action = allowed_actions[letter];
       sg_support_partition next = {0};
       status = sg_support_partition_apply_action(automaton, &search.nodes[parent].partition, action,
                                                  &next);
@@ -916,11 +1225,17 @@ static sg_status sg_disambiguation_finalize(const sg_automaton *automaton, const
 
 sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_oracle *oracle,
                                const size_t *initial_states, size_t initial_count, size_t bound,
+                               const size_t *allowed_actions, size_t allowed_action_count,
                                size_t budget, sg_plan_result *result) {
   if (automaton == NULL || oracle == NULL || oracle->automaton != automaton ||
       initial_states == NULL || initial_count == 0U || bound == 0U || budget == 0U ||
-      result == NULL) {
+      allowed_actions == NULL || allowed_action_count == 0U || result == NULL) {
     return SG_ERR_INVALID_ARGUMENT;
+  }
+  for (size_t index = 0U; index < allowed_action_count; ++index) {
+    if (allowed_actions[index] >= automaton->action_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
   }
   const uint64_t start = sg_monotonic_time_us();
   sg_status status = sg_plan_result_init(automaton, result);
@@ -944,6 +1259,23 @@ sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_orac
     status = sg_best_resolution(automaton, oracle, &initial, unique_count, &heuristic,
                                 &heuristic_partition);
     if (status == SG_OK) {
+      for (size_t step = 0U; step < heuristic.length; ++step) {
+        bool allowed = false;
+        for (size_t letter = 0U; letter < allowed_action_count; ++letter) {
+          if (heuristic.actions[step] == allowed_actions[letter]) {
+            allowed = true;
+            break;
+          }
+        }
+        if (!allowed) {
+          sg_word_free(&heuristic);
+          sg_trace_partition_free(&heuristic_partition);
+          status = SG_ERR_NOT_FOUND;
+          break;
+        }
+      }
+    }
+    if (status == SG_OK) {
       size_t best = 0U;
       size_t worst = 0U;
       size_t total = 0U;
@@ -961,8 +1293,8 @@ sg_status sg_plan_disambiguate(const sg_automaton *automaton, const sg_pair_orac
     }
     sg_trace_partition_free(&heuristic_partition);
     if (status == SG_ERR_NOT_FOUND) {
-      status = sg_partition_bfs(automaton, &initial, bound, budget, &result->expansions,
-                                &result->word, &result->outcome);
+      status = sg_partition_bfs(automaton, &initial, bound, allowed_actions, allowed_action_count,
+                                budget, &result->expansions, &result->word, &result->outcome);
       if (status == SG_OK && result->outcome == SG_OUTCOME_PLAN) {
         result->method = SG_METHOD_PARTITION_BFS;
         status = sg_disambiguation_finalize(automaton, &initial, bound, result);

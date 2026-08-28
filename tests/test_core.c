@@ -162,6 +162,7 @@ static void test_names_and_builder_validation(void) {
   CHECK(strcmp(sg_status_name(SG_ERR_STALE_GENERATION), "STALE_GENERATION") == 0);
   CHECK(strcmp(sg_plan_outcome_name(SG_OUTCOME_RESOURCE_BOUND), "RESOURCE_BOUND") == 0);
   CHECK(strcmp(sg_plan_method_name(SG_METHOD_PARTITION_BFS), "PARTITION_BFS") == 0);
+  CHECK(strcmp(sg_plan_method_name(SG_METHOD_BELIEF_BFS), "BELIEF_BFS") == 0);
   CHECK(strcmp(sg_monitor_decision_name(SG_MONITOR_MODEL_VIOLATION), "MODEL_VIOLATION") == 0);
 
   sg_automaton_builder *builder = NULL;
@@ -267,6 +268,20 @@ static void test_planners_explanation_and_monitor(void) {
   CHECK(sync.final_support_size == 1U);
   CHECK(sync.generation == 7U);
 
+  const size_t merge_actions[] = {action_id(automaton, "to_corridor"),
+                                  action_id(automaton, "go_west")};
+  sg_plan_result restricted = {0};
+  CHECK(sg_plan_sync_allowed(automaton, oracle, initial, 2U, merge_actions, 2U, 16U, &restricted) ==
+        SG_OK);
+  CHECK(restricted.outcome == SG_OUTCOME_PLAN);
+  CHECK(restricted.word.length == 2U);
+  sg_plan_result_free(&restricted);
+  const size_t nonmerging_actions[] = {action_id(automaton, "to_corridor")};
+  CHECK(sg_plan_sync_allowed(automaton, oracle, initial, 2U, nonmerging_actions, 1U, 16U,
+                             &restricted) == SG_OK);
+  CHECK(restricted.outcome == SG_OUTCOME_NO_PLAN);
+  sg_plan_result_free(&restricted);
+
   size_t final_states[sizeof(initial) / sizeof(initial[0])] = {0U};
   size_t final_count = 0U;
   CHECK(sg_apply_word(automaton, initial, 2U, &sync.word, final_states, &final_count) == SG_OK);
@@ -312,8 +327,10 @@ static void test_planners_explanation_and_monitor(void) {
   CHECK(monitor.decision == SG_MONITOR_STALE_GENERATION);
   sg_monitor_result_free(&monitor);
 
+  const size_t reveal_actions[] = {action_id(automaton, "to_corridor")};
   sg_plan_result disambiguation = {0};
-  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 2U, 1U, 16U, &disambiguation) == SG_OK);
+  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 2U, 1U, reveal_actions, 1U, 16U,
+                             &disambiguation) == SG_OK);
   CHECK(disambiguation.outcome == SG_OUTCOME_PLAN);
   CHECK(disambiguation.method == SG_METHOD_PAIR_RESOLUTION);
   CHECK(disambiguation.word.length == 1U);
@@ -323,6 +340,10 @@ static void test_planners_explanation_and_monitor(void) {
   CHECK(disambiguation.homing);
 
   sg_plan_result_free(&disambiguation);
+  const size_t nondiscriminating_actions[] = {action_id(automaton, "to_wall")};
+  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 2U, 1U, nondiscriminating_actions, 1U, 16U,
+                             &disambiguation) == SG_OK);
+  CHECK(disambiguation.outcome == SG_OUTCOME_NO_PLAN);
   sg_plan_result_free(&sync);
   sg_pair_oracle_free(oracle);
   sg_automaton_free(automaton);
@@ -338,12 +359,15 @@ static void test_exact_partition_search(void) {
       state_id(automaton, "C"),
   };
 
+  const size_t observer_actions[] = {action_id(automaton, "ask_a"), action_id(automaton, "ask_b")};
   sg_plan_result result = {0};
-  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 3U, 1U, 1U, &result) == SG_OK);
+  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 3U, 1U, observer_actions, 2U, 1U,
+                             &result) == SG_OK);
   CHECK(result.outcome == SG_OUTCOME_RESOURCE_BOUND);
   sg_plan_result_free(&result);
 
-  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 3U, 1U, 16U, &result) == SG_OK);
+  CHECK(sg_plan_disambiguate(automaton, oracle, initial, 3U, 1U, observer_actions, 2U, 16U,
+                             &result) == SG_OK);
   CHECK(result.outcome == SG_OUTCOME_PLAN);
   CHECK(result.method == SG_METHOD_PARTITION_BFS);
   CHECK(result.word.length == 2U);
@@ -358,10 +382,49 @@ static void test_exact_partition_search(void) {
   sg_automaton_free(automaton);
 }
 
+static void test_goal_set_planner(void) {
+  sg_automaton *automaton = build_warehouse();
+  const size_t initial[] = {
+      state_id(automaton, "west_bay:east"),
+      state_id(automaton, "east_bay:west"),
+  };
+  const size_t corridor_goals[] = {
+      state_id(automaton, "corridor_w:east"),
+      state_id(automaton, "corridor_e:west"),
+  };
+  const size_t to_corridor[] = {action_id(automaton, "to_corridor")};
+  sg_plan_result result = {0};
+  CHECK(sg_plan_goal(automaton, initial, 2U, corridor_goals, 2U, to_corridor, 1U, 16U, &result) ==
+        SG_OK);
+  CHECK(result.outcome == SG_OUTCOME_PLAN);
+  CHECK(result.method == SG_METHOD_BELIEF_BFS);
+  CHECK(result.word.length == 1U);
+  CHECK(result.word.actions[0] == to_corridor[0]);
+  CHECK(result.final_state == SG_INDEX_NONE);
+  CHECK(result.final_support_size == 2U);
+  sg_plan_result_free(&result);
+
+  CHECK(sg_plan_goal(automaton, corridor_goals, 2U, corridor_goals, 2U, to_corridor, 1U, 16U,
+                     &result) == SG_OK);
+  CHECK(result.outcome == SG_OUTCOME_ALREADY_SATISFIED);
+  CHECK(result.word.length == 0U);
+  sg_plan_result_free(&result);
+
+  const size_t dock[] = {state_id(automaton, "dock:north")};
+  CHECK(sg_plan_goal(automaton, initial, 2U, dock, 1U, to_corridor, 1U, 16U, &result) == SG_OK);
+  CHECK(result.outcome == SG_OUTCOME_NO_PLAN);
+  sg_plan_result_free(&result);
+  CHECK(sg_plan_goal(automaton, initial, 2U, dock, 1U, to_corridor, 1U, 1U, &result) == SG_OK);
+  CHECK(result.outcome == SG_OUTCOME_RESOURCE_BOUND);
+  sg_plan_result_free(&result);
+  sg_automaton_free(automaton);
+}
+
 int main(void) {
   test_names_and_builder_validation();
   test_automaton_and_oracle();
   test_planners_explanation_and_monitor();
   test_exact_partition_search();
+  test_goal_set_planner();
   return EXIT_SUCCESS;
 }

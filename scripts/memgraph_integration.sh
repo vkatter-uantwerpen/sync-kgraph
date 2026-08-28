@@ -84,7 +84,7 @@ CALL mg.procedures() YIELD name
 WITH name
 WHERE name STARTS WITH "sync."
 WITH count(name) AS procedures
-RETURN CASE WHEN procedures = 6 THEN "PASS" ELSE "FAIL" END AS result;'
+RETURN CASE WHEN procedures = 8 THEN "PASS" ELSE "FAIL" END AS result;'
 
 assert_pass "prepare model" '
 CALL sync.prepare_model("warehouse", true)
@@ -123,9 +123,21 @@ RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
                  AND final_support_size = 1 AND generation = 1
             THEN "PASS" ELSE "FAIL" END AS result;'
 
+assert_pass "restricted synchronization plan" '
+CALL sync.plan_sync_allowed(
+  "warehouse", ["west_bay:east", "east_bay:west"],
+  ["to_corridor", "go_west"], 64)
+YIELD status, outcome, method, word, final_state_key, final_support_size
+RETURN CASE WHEN status = "OK" AND outcome = "PLAN"
+                 AND method = "PAIR_MERGE"
+                 AND word = ["to_corridor", "go_west"]
+                 AND final_state_key = "dock:north" AND final_support_size = 1
+            THEN "PASS" ELSE "FAIL" END AS result;'
+
 assert_pass "disambiguation plan" '
 CALL sync.plan_disambiguate(
-  "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
+  "warehouse", ["west_bay:east", "east_bay:west"], 1,
+  ["to_corridor", "to_wall", "go_west", "go_east"], 64)
 YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation
 RETURN CASE WHEN status = "OK" AND outcome = "PLAN"

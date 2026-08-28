@@ -115,6 +115,8 @@ const char *sg_plan_method_name(sg_plan_method method) {
     return "PAIR_RESOLUTION";
   case SG_METHOD_PARTITION_BFS:
     return "PARTITION_BFS";
+  case SG_METHOD_BELIEF_BFS:
+    return "BELIEF_BFS";
   }
   return "UNKNOWN";
 }

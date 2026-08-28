@@ -2,6 +2,7 @@ CALL sync.plan_disambiguate(
   "warehouse",
   ["west_bay:east", "east_bay:west"],
   1,
+  ["to_corridor", "to_wall", "go_west", "go_east"],
   64
 )
 YIELD status, outcome, method, word, length, best_support_size,

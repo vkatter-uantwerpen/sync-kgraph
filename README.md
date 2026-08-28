@@ -56,7 +56,9 @@ Expected procedure names:
 sync.explain_plan
 sync.mark_dirty
 sync.plan_disambiguate
+sync.plan_goal
 sync.plan_sync
+sync.plan_sync_allowed
 sync.prepare_model
 sync.validate_update
 ```
@@ -131,7 +133,9 @@ schema-agnostic trigger cannot identify the affected model safely.
 ```cypher
 CALL sync.prepare_model(model, materialize_pair_edges = false)
 CALL sync.plan_sync(model, hypotheses, budget)
-CALL sync.plan_disambiguate(model, hypotheses, bound, budget)
+CALL sync.plan_sync_allowed(model, hypotheses, actions, budget)
+CALL sync.plan_goal(model, hypotheses, goals, actions, budget)
+CALL sync.plan_disambiguate(model, hypotheses, bound, actions, budget)
 CALL sync.explain_plan(model, generation, hypotheses, word)
 CALL sync.validate_update(
   model, generation, hypotheses, word, completed_steps,
@@ -140,7 +144,7 @@ CALL sync.mark_dirty(model)
 ```
 
 `hypotheses`, `reported_hypotheses`, and returned supports are lists of
-`state_key` strings. Words are lists of `action_key` strings. `budget` limits
+`state_key` strings. Words are lists of `action_key` strings. `actions` restricts `plan_sync_allowed`, `plan_goal`, and `plan_disambiguate` to executable action keys. `budget` limits
 search expansions; `bound` is the required worst-case output-branch support
 size. A bound of one requests a homing word.
 
@@ -236,7 +240,8 @@ Expected:
 
 ```cypher
 CALL sync.plan_disambiguate(
-  "warehouse", ["west_bay:east", "east_bay:west"], 1, 64)
+  "warehouse", ["west_bay:east", "east_bay:west"], 1,
+  ["to_corridor", "to_wall", "go_west", "go_east"], 64)
 YIELD status, outcome, method, word, length, best_support_size,
       worst_support_size, branch_count, homing, generation
 RETURN status, outcome, method, word, length, best_support_size,

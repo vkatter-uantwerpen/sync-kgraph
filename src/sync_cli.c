@@ -120,8 +120,10 @@ static int run_warehouse_example(void) {
   print_word(automaton, &sync.word);
   printf("\nsync.final_state: %s\n", sg_automaton_state_key(automaton, sync.final_state));
 
+  const size_t reveal_actions[] = {0U, 1U, 2U, 3U};
   sg_plan_result reveal = {0};
-  status = sg_plan_disambiguate(automaton, oracle, initial, 2U, 1U, 64U, &reveal);
+  status =
+      sg_plan_disambiguate(automaton, oracle, initial, 2U, 1U, reveal_actions, 4U, 64U, &reveal);
   if (status == SG_OK) {
     printf("reveal.outcome: %s\n", sg_plan_outcome_name(reveal.outcome));
     printf("reveal.method: %s\n", sg_plan_method_name(reveal.method));
