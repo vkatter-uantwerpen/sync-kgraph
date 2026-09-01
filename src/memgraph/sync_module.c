@@ -996,9 +996,19 @@ static bool materialize_oracle(struct mgp_graph *graph, struct mgp_memory *memor
   return ok;
 }
 
-static bool runtime_load(struct mgp_graph *graph, struct mgp_memory *memory, const char *model,
-                         sg_automaton **automaton, sg_pair_oracle **oracle,
-                         struct mgp_result *result) {
+/* The automaton half of runtime_load, on its own.
+ *
+ * Three procedures - plan_goal, explain_plan and validate_update - call
+ * sg_* entry points that take only the automaton. They were nonetheless
+ * loading the pair oracle through runtime_load and freeing it unused, and
+ * load_oracle reads one SyncPair node per state pair: 353,220 rows for an
+ * 840-state model. Measured against that model, a plan_goal call with
+ * nothing to search cost 956 ms, of which the search was ~10 ms; the rest
+ * was this load. validate_update runs after every executed action, so a
+ * robot paid it once per letter. */
+static bool runtime_load_automaton(struct mgp_graph *graph, struct mgp_memory *memory,
+                                   const char *model, sg_automaton **automaton,
+                                   struct mgp_result *result) {
   model_metadata metadata = {0};
   sg_status status = load_automaton(graph, memory, model, &metadata, automaton);
   if (status != SG_OK) {
@@ -1011,7 +1021,16 @@ static bool runtime_load(struct mgp_graph *graph, struct mgp_memory *memory, con
     *automaton = NULL;
     return false;
   }
-  status = load_oracle(graph, memory, model, *automaton, oracle);
+  return true;
+}
+
+static bool runtime_load(struct mgp_graph *graph, struct mgp_memory *memory, const char *model,
+                         sg_automaton **automaton, sg_pair_oracle **oracle,
+                         struct mgp_result *result) {
+  if (!runtime_load_automaton(graph, memory, model, automaton, result)) {
+    return false;
+  }
+  sg_status status = load_oracle(graph, memory, model, *automaton, oracle);
   if (status != SG_OK) {
     set_status_error(result, "prepared oracle is invalid", status);
     sg_automaton_free(*automaton);
@@ -1219,8 +1238,9 @@ static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
     return;
   }
   sg_automaton *automaton = NULL;
-  sg_pair_oracle *oracle = NULL;
-  if (!runtime_load(graph, memory, model, &automaton, &oracle, result)) {
+  /* Automaton only: this procedure's sg_* call does not take the pair
+   * table, and loading that reads 353,220 SyncPair rows. */
+  if (!runtime_load_automaton(graph, memory, model, &automaton, result)) {
     return;
   }
   size_t *hypotheses = NULL;
@@ -1236,7 +1256,6 @@ static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
     free(hypotheses);
     free(goals);
     free(actions);
-    sg_pair_oracle_free(oracle);
     sg_automaton_free(automaton);
     return;
   }
@@ -1271,7 +1290,6 @@ static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
   free(hypotheses);
   free(goals);
   free(actions);
-  sg_pair_oracle_free(oracle);
   sg_automaton_free(automaton);
 }
 
@@ -1375,8 +1393,9 @@ static void explain_plan_cb(struct mgp_list *arguments, struct mgp_graph *graph,
     return;
   }
   sg_automaton *automaton = NULL;
-  sg_pair_oracle *oracle = NULL;
-  if (!runtime_load(graph, memory, model, &automaton, &oracle, result)) {
+  /* Automaton only: this procedure's sg_* call does not take the pair
+   * table, and loading that reads 353,220 SyncPair rows. */
+  if (!runtime_load_automaton(graph, memory, model, &automaton, result)) {
     return;
   }
   size_t *hypotheses = NULL;
@@ -1386,7 +1405,6 @@ static void explain_plan_cb(struct mgp_list *arguments, struct mgp_graph *graph,
       !argument_to_word(automaton, arguments, 3U, &word)) {
     set_error(result, "hypotheses or word contain unknown prepared keys");
     free(hypotheses);
-    sg_pair_oracle_free(oracle);
     sg_automaton_free(automaton);
     return;
   }
@@ -1402,7 +1420,6 @@ static void explain_plan_cb(struct mgp_list *arguments, struct mgp_graph *graph,
   }
   sg_word_free(&word);
   free(hypotheses);
-  sg_pair_oracle_free(oracle);
   sg_automaton_free(automaton);
 }
 
@@ -1479,8 +1496,9 @@ static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *gra
     return;
   }
   sg_automaton *automaton = NULL;
-  sg_pair_oracle *oracle = NULL;
-  if (!runtime_load(graph, memory, model, &automaton, &oracle, result)) {
+  /* Automaton only: this procedure's sg_* call does not take the pair
+   * table, and loading that reads 353,220 SyncPair rows. */
+  if (!runtime_load_automaton(graph, memory, model, &automaton, result)) {
     return;
   }
   size_t *hypotheses = NULL;
@@ -1497,7 +1515,6 @@ static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *gra
     sg_word_free(&word);
     free(hypotheses);
     free(reported);
-    sg_pair_oracle_free(oracle);
     sg_automaton_free(automaton);
     return;
   }
@@ -1517,7 +1534,6 @@ static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *gra
   sg_word_free(&word);
   free(hypotheses);
   free(reported);
-  sg_pair_oracle_free(oracle);
   sg_automaton_free(automaton);
 }
 
