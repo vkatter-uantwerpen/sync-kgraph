@@ -1238,8 +1238,7 @@ static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
     return;
   }
   sg_automaton *automaton = NULL;
-  /* Automaton only: this procedure's sg_* call does not take the pair
-   * table, and loading that reads 353,220 SyncPair rows. */
+  /* Automaton only - see runtime_load_automaton. */
   if (!runtime_load_automaton(graph, memory, model, &automaton, result)) {
     return;
   }
@@ -1393,8 +1392,7 @@ static void explain_plan_cb(struct mgp_list *arguments, struct mgp_graph *graph,
     return;
   }
   sg_automaton *automaton = NULL;
-  /* Automaton only: this procedure's sg_* call does not take the pair
-   * table, and loading that reads 353,220 SyncPair rows. */
+  /* Automaton only - see runtime_load_automaton. */
   if (!runtime_load_automaton(graph, memory, model, &automaton, result)) {
     return;
   }
@@ -1496,8 +1494,7 @@ static void validate_update_cb(struct mgp_list *arguments, struct mgp_graph *gra
     return;
   }
   sg_automaton *automaton = NULL;
-  /* Automaton only: this procedure's sg_* call does not take the pair
-   * table, and loading that reads 353,220 SyncPair rows. */
+  /* Automaton only - see runtime_load_automaton. */
   if (!runtime_load_automaton(graph, memory, model, &automaton, result)) {
     return;
   }
