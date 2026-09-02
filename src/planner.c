@@ -41,6 +41,18 @@ typedef struct {
   size_t capacity;
 } sg_search_nodes;
 
+typedef struct {
+  sg_bitset support;
+  size_t parent;
+  size_t action;
+} sg_belief_node;
+
+typedef struct {
+  sg_belief_node *nodes;
+  size_t count;
+  size_t capacity;
+} sg_belief_search;
+
 static sg_status sg_bitset_init(sg_bitset *set, size_t state_count) {
   if (set == NULL || state_count == 0U) {
     return SG_ERR_INVALID_ARGUMENT;
@@ -1055,6 +1067,202 @@ sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *init
   result->planning_time_us = sg_elapsed_us(start);
   sg_bitset_free(&initial);
   sg_bitset_free(&active);
+  if (status != SG_OK) {
+    sg_plan_result_free(result);
+  }
+  return status;
+}
+
+
+/* Goal-directed planning over beliefs.
+ *
+ * Deliberately independent of the pair oracle: reaching a goal set is a
+ * reachability question about supports, not about distinguishing states, so
+ * this is a BFS over belief supports under the allowed alphabet. That is also
+ * why it survived the 0.4.0 refactor untouched - it never used the machinery
+ * upstream reshaped.
+ */
+
+static void sg_belief_search_free(sg_belief_search *search) {
+  if (search == NULL) {
+    return;
+  }
+  for (size_t index = 0U; index < search->count; ++index) {
+    sg_bitset_free(&search->nodes[index].support);
+  }
+  free(search->nodes);
+  search->nodes = NULL;
+  search->count = 0U;
+  search->capacity = 0U;
+}
+
+static size_t sg_belief_search_find(const sg_belief_search *search, const sg_bitset *support) {
+  for (size_t index = 0U; index < search->count; ++index) {
+    if (sg_bitset_equal(&search->nodes[index].support, support)) {
+      return index;
+    }
+  }
+  return SG_INDEX_NONE;
+}
+
+static sg_status sg_belief_search_add(sg_belief_search *search, sg_bitset *support, size_t parent,
+                                      size_t action, size_t *index) {
+  if (search->count == search->capacity) {
+    const size_t capacity = search->capacity == 0U ? 32U : search->capacity * 2U;
+    size_t bytes = 0U;
+    if (capacity < search->capacity ||
+        !sg_size_multiply(capacity, sizeof(*search->nodes), &bytes)) {
+      return SG_ERR_ALLOC;
+    }
+    sg_belief_node *nodes = realloc(search->nodes, bytes);
+    if (nodes == NULL) {
+      return SG_ERR_ALLOC;
+    }
+    search->nodes = nodes;
+    search->capacity = capacity;
+  }
+  *index = search->count;
+  search->nodes[search->count] = (sg_belief_node){
+      .support = *support,
+      .parent = parent,
+      .action = action,
+  };
+  support->words = NULL;
+  ++search->count;
+  return SG_OK;
+}
+
+static sg_status sg_belief_reconstruct(const sg_belief_search *search, size_t goal, sg_word *word) {
+  sg_status status = sg_word_init(word);
+  for (size_t cursor = goal; status == SG_OK && search->nodes[cursor].parent != SG_INDEX_NONE;
+       cursor = search->nodes[cursor].parent) {
+    status = sg_word_append(word, search->nodes[cursor].action);
+  }
+  for (size_t first = 0U, second = word->length; first < second && second != 0U; ++first) {
+    --second;
+    const size_t temporary = word->actions[first];
+    word->actions[first] = word->actions[second];
+    word->actions[second] = temporary;
+  }
+  if (status != SG_OK) {
+    sg_word_free(word);
+  }
+  return status;
+}
+
+static sg_status sg_goal_finalize(const sg_automaton *automaton, const sg_bitset *initial,
+                                  const sg_bitset *goals, sg_plan_result *result) {
+  sg_bitset final = {0};
+  sg_status status = sg_apply_word_set(automaton, initial, &result->word, &final);
+  if (status == SG_OK && !sg_bitset_subset(&final, goals)) {
+    status = SG_ERR_INVALID_MODEL;
+  }
+  if (status == SG_OK) {
+    result->final_support_size = sg_bitset_count(&final);
+    result->final_state = SG_INDEX_NONE;
+    if (result->final_support_size == 1U) {
+      size_t count = 0U;
+      sg_bitset_to_ids(&final, &result->final_state, &count);
+    }
+    status = sg_fill_plan_metrics(automaton, initial, result);
+  }
+  sg_bitset_free(&final);
+  return status;
+}
+
+sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_states,
+                       size_t initial_count, const size_t *goal_states, size_t goal_count,
+                       const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
+                       sg_plan_result *result) {
+  if (automaton == NULL || initial_states == NULL || initial_count == 0U || goal_states == NULL ||
+      goal_count == 0U || allowed_actions == NULL || allowed_action_count == 0U || budget == 0U ||
+      result == NULL) {
+    return SG_ERR_INVALID_ARGUMENT;
+  }
+  for (size_t index = 0U; index < allowed_action_count; ++index) {
+    if (allowed_actions[index] >= automaton->action_count) {
+      return SG_ERR_INVALID_ARGUMENT;
+    }
+  }
+
+  const uint64_t start = sg_monotonic_time_us();
+  sg_status status = sg_plan_result_init(automaton, result);
+  sg_bitset initial = {0};
+  sg_bitset goals = {0};
+  if (status == SG_OK) {
+    status = sg_bitset_from_ids(automaton->state_count, initial_states, initial_count, &initial);
+  }
+  if (status == SG_OK) {
+    status = sg_bitset_from_ids(automaton->state_count, goal_states, goal_count, &goals);
+  }
+  if (status != SG_OK) {
+    sg_bitset_free(&initial);
+    sg_bitset_free(&goals);
+    sg_plan_result_free(result);
+    return status;
+  }
+
+  if (sg_bitset_subset(&initial, &goals)) {
+    result->outcome = SG_OUTCOME_ALREADY_SATISFIED;
+    result->method = SG_METHOD_BELIEF_BFS;
+    status = sg_goal_finalize(automaton, &initial, &goals, result);
+  } else {
+    sg_belief_search search = {0};
+    sg_bitset root = {0};
+    status = sg_bitset_copy(&initial, &root);
+    size_t root_index = 0U;
+    if (status == SG_OK) {
+      status = sg_belief_search_add(&search, &root, SG_INDEX_NONE, SG_INDEX_NONE, &root_index);
+    }
+    size_t head = 0U;
+    size_t found = SG_INDEX_NONE;
+    while (status == SG_OK && head < search.count && found == SG_INDEX_NONE) {
+      if (result->expansions >= budget) {
+        result->outcome = SG_OUTCOME_RESOURCE_BOUND;
+        break;
+      }
+      const size_t parent = head++;
+      ++result->expansions;
+      for (size_t letter = 0U; letter < allowed_action_count; ++letter) {
+        sg_bitset next = {0};
+        status = sg_bitset_init(&next, automaton->state_count);
+        if (status != SG_OK) {
+          break;
+        }
+        const size_t action = allowed_actions[letter];
+        sg_apply_action_set(automaton, &search.nodes[parent].support, action, &next);
+        if (sg_belief_search_find(&search, &next) != SG_INDEX_NONE) {
+          sg_bitset_free(&next);
+          continue;
+        }
+        size_t next_index = 0U;
+        status = sg_belief_search_add(&search, &next, parent, action, &next_index);
+        if (status != SG_OK) {
+          sg_bitset_free(&next);
+          break;
+        }
+        if (sg_bitset_subset(&search.nodes[next_index].support, &goals)) {
+          found = next_index;
+          break;
+        }
+      }
+    }
+    if (status == SG_OK && found != SG_INDEX_NONE) {
+      status = sg_belief_reconstruct(&search, found, &result->word);
+      if (status == SG_OK) {
+        result->outcome = SG_OUTCOME_PLAN;
+        result->method = SG_METHOD_BELIEF_BFS;
+        status = sg_goal_finalize(automaton, &initial, &goals, result);
+      }
+    } else if (status == SG_OK && result->outcome != SG_OUTCOME_RESOURCE_BOUND) {
+      result->outcome = SG_OUTCOME_NO_PLAN;
+    }
+    sg_bitset_free(&root);
+    sg_belief_search_free(&search);
+  }
+  result->planning_time_us = sg_elapsed_us(start);
+  sg_bitset_free(&initial);
+  sg_bitset_free(&goals);
   if (status != SG_OK) {
     sg_plan_result_free(result);
   }

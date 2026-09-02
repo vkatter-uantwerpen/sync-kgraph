@@ -2182,6 +2182,71 @@ static void plan_sync_allowed_cb(struct mgp_list *arguments, struct mgp_graph *g
   sg_automaton_free(automaton);
 }
 
+static void plan_goal_cb(struct mgp_list *arguments, struct mgp_graph *graph,
+                         struct mgp_result *result, struct mgp_memory *memory) {
+  const char *model = NULL;
+  int64_t budget = 0;
+  if (!get_string_arg(arguments, 0U, &model) || !get_int_arg(arguments, 4U, &budget) ||
+      budget <= 0 || (uint64_t)budget > (uint64_t)SIZE_MAX) {
+    set_error(result, "expected model, hypotheses, goals, actions, and positive budget");
+    return;
+  }
+  sg_automaton *automaton = NULL;
+  model_metadata metadata = {0};
+  if (!load_prepared_automaton(graph, memory, model, &metadata, &automaton, result)) {
+    return;
+  }
+  size_t *hypotheses = NULL;
+  size_t hypothesis_count = 0U;
+  size_t *goals = NULL;
+  size_t goal_count = 0U;
+  size_t *actions = NULL;
+  size_t action_count = 0U;
+  if (!argument_to_ids(automaton, arguments, 1U, false, false, &hypotheses, &hypothesis_count) ||
+      !argument_to_ids(automaton, arguments, 2U, false, false, &goals, &goal_count) ||
+      !argument_to_ids(automaton, arguments, 3U, true, false, &actions, &action_count)) {
+    set_error(result, "hypotheses, goals, or actions contain unknown prepared keys");
+    free(hypotheses);
+    free(goals);
+    free(actions);
+    sg_automaton_free(automaton);
+    return;
+  }
+  sg_plan_result plan = {0};
+  planning_metrics metrics = {.source = ORACLE_SOURCE_PERSISTED, .cache = CACHE_STATE_BYPASSED};
+  const sg_status status = sg_plan_goal(automaton, hypotheses, hypothesis_count, goals, goal_count,
+                                        actions, action_count, (size_t)budget, &plan);
+  if (status != SG_OK) {
+    set_status_error(result, "goal planning failed", status);
+  } else {
+    size_t *final_states = calloc(hypothesis_count, sizeof(*final_states));
+    size_t final_count = 0U;
+    sg_status apply_status = SG_OK;
+    if (final_states == NULL) {
+      apply_status = SG_ERR_ALLOC;
+    } else if (plan.outcome == SG_OUTCOME_PLAN || plan.outcome == SG_OUTCOME_ALREADY_SATISFIED) {
+      apply_status = sg_apply_word(automaton, hypotheses, hypothesis_count, &plan.word,
+                                   final_states, &final_count);
+    }
+    struct mgp_result_record *record = NULL;
+    int64_t final_support = 0;
+    if (apply_status != SG_OK || !size_to_int64(plan.final_support_size, &final_support) ||
+        !new_record(result, &record) ||
+        !insert_plan_common(record, automaton, &plan, &metrics, memory) ||
+        !insert_key_list(record, "final_state_keys", automaton, final_states, final_count, false,
+                         memory) ||
+        !insert_int(record, "final_support_size", final_support, memory)) {
+      set_error(result, "failed to create goal-planning result");
+    }
+    free(final_states);
+  }
+  sg_plan_result_free(&plan);
+  free(hypotheses);
+  free(goals);
+  free(actions);
+  sg_automaton_free(automaton);
+}
+
 static void plan_disambiguate_impl(struct mgp_list *arguments, struct mgp_graph *graph,
                                    struct mgp_result *result, struct mgp_memory *memory,
                                    oracle_source source, bool restricted) {
@@ -2928,6 +2993,23 @@ static bool register_plan_sync_allowed(struct mgp_module *module, struct mgp_typ
          add_result(procedure, "final_support_size", int_type);
 }
 
+static bool register_plan_goal(struct mgp_module *module, struct mgp_type *string_type,
+                               struct mgp_type *int_type, struct mgp_type *list_type) {
+  struct mgp_proc *procedure = NULL;
+  if (!mg_ok(mgp_module_add_read_procedure(module, "plan_goal", plan_goal_cb, &procedure)) ||
+      procedure == NULL) {
+    return false;
+  }
+  return add_required(procedure, "model", string_type) &&
+         add_required(procedure, "hypotheses", list_type) &&
+         add_required(procedure, "goals", list_type) &&
+         add_required(procedure, "actions", list_type) &&
+         add_required(procedure, "budget", int_type) &&
+         add_plan_common_results(procedure, string_type, int_type, list_type) &&
+         add_result(procedure, "final_state_keys", list_type) &&
+         add_result(procedure, "final_support_size", int_type);
+}
+
 static bool register_explain(struct mgp_module *module, struct mgp_type *string_type,
                              struct mgp_type *int_type, struct mgp_type *list_type) {
   struct mgp_proc *procedure = NULL;
@@ -3046,6 +3128,7 @@ int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
                                   plan_disambiguate_allowed_cb, string_type, bool_type, int_type,
                                   list_type) ||
       !register_plan_sync_allowed(module, string_type, int_type, list_type) ||
+      !register_plan_goal(module, string_type, int_type, list_type) ||
       !register_explain(module, string_type, int_type, list_type) ||
       !register_validate(module, memory, string_type, bool_type, int_type, list_type) ||
       !register_update_cells(module, memory, string_type, bool_type, int_type, map_list_type) ||
