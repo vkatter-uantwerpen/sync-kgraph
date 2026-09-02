@@ -36,6 +36,7 @@ typedef enum {
   SG_METHOD_PAIR_MERGE,
   SG_METHOD_PAIR_RESOLUTION,
   SG_METHOD_PARTITION_BFS,
+  SG_METHOD_BELIEF_BFS,
 } sg_plan_method;
 
 typedef enum {
@@ -179,6 +180,24 @@ sg_status sg_plan_disambiguate_from_records(const sg_automaton *automaton,
                                             const sg_pair_record_source *source,
                                             const size_t *initial_states, size_t initial_count,
                                             size_t bound, size_t budget, sg_plan_result *result);
+sg_status sg_plan_sync_allowed(const sg_automaton *automaton, const size_t *initial_states,
+                               size_t initial_count,
+                               const size_t *allowed_actions, size_t allowed_action_count,
+                               size_t budget, sg_plan_result *result);
+sg_status sg_plan_disambiguate_allowed_from_records(
+    const sg_automaton *automaton, const sg_pair_record_source *source,
+    const size_t *initial_states, size_t initial_count, size_t bound,
+    const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
+    sg_plan_result *result);
+sg_status sg_plan_disambiguate_allowed(const sg_automaton *automaton,
+                                       const sg_pair_oracle *oracle, const size_t *initial_states,
+                                       size_t initial_count, size_t bound,
+                                       const size_t *allowed_actions, size_t allowed_action_count,
+                                       size_t budget, sg_plan_result *result);
+sg_status sg_plan_goal(const sg_automaton *automaton, const size_t *initial_states,
+                       size_t initial_count, const size_t *goal_states, size_t goal_count,
+                       const size_t *allowed_actions, size_t allowed_action_count, size_t budget,
+                       sg_plan_result *result);
 void sg_plan_result_free(sg_plan_result *result);
 
 sg_status sg_apply_word(const sg_automaton *automaton, const size_t *initial_states,
